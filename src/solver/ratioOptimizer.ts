@@ -127,6 +127,24 @@ export interface RatioSolverStageTelemetry {
   elapsedMs: number;
 }
 
+export type RatioNativeFailureKind =
+  | 'initial_infeasible'
+  | 'objective_lock_infeasible'
+  | 'rounded_machine_infeasible'
+  | 'numeric_validation'
+  | 'materialization_validation'
+  | 'internal';
+
+export interface RatioNativeFailureDiagnostics {
+  kind: RatioNativeFailureKind;
+  stageCode: number;
+  stage: string;
+  backend: 'soplex' | 'scip' | 'internal' | 'unknown';
+  objectiveCode: number;
+  objectiveValue?: number;
+  detail?: string;
+}
+
 export interface RatioSolverTelemetry {
   solver: 'native' | 'mps';
   bundlePath?: ScipBundlePath;
@@ -160,6 +178,8 @@ export interface RatioSolverTelemetry {
   roundedVariableCount?: number;
   roundedMilpProfile?: string;
   incumbentPolishMs?: number;
+  roundedMachineRepairCount?: number;
+  nativeFailure?: RatioNativeFailureDiagnostics;
   warmupMs?: number;
   profileUsed?: string;
   variableCount?: number;
@@ -181,6 +201,7 @@ export interface RatioOptimizerResponse {
   machineCounts?: Record<string, number>;
   connectionFlows?: Record<string, number>;
   diagnostics?: RatioFailureDiagnostics;
+  nativeFailure?: RatioNativeFailureDiagnostics;
   telemetry?: RatioSolverTelemetry;
 }
 
@@ -276,6 +297,13 @@ export interface RatioOptimizerProgressMessage {
   progress: RatioSolverProgress;
 }
 
+export interface RatioOptimizerNativeStageMessage {
+  type: 'native-stage';
+  requestId?: number;
+  stageCode: number;
+  elapsedMs: number;
+}
+
 export interface RatioOptimizerWarmupResult {
   type: 'warmup-result';
   feasible: boolean;
@@ -289,8 +317,29 @@ export type RatioOptimizerWorkerRequest =
   | RatioOptimizerCancelRequest;
 export type RatioOptimizerWorkerMessage =
   | RatioOptimizerProgressMessage
+  | RatioOptimizerNativeStageMessage
   | RatioOptimizerWarmupResult
   | RatioOptimizerResponse;
+
+const NATIVE_STAGE_MESSAGES: Record<number, string> = {
+  0: 'Preparing the optimization model.',
+  1: 'Satisfying connected-input shortages.',
+  2: 'Balancing excess routed into sinks.',
+  3: 'Optimizing Priority 1.',
+  4: 'Optimizing Priority 2.',
+  5: 'Optimizing Priority 3.',
+  6: 'Reducing the final machine count.',
+  7: 'Finalizing the optimized ratios.',
+};
+
+export function nativeStageToProgress(stageCode: number, elapsedMs: number): RatioSolverProgress {
+  return {
+    phase: stageCode > 6 ? 'finalizing' : stageCode === 0 ? 'building' : 'solving',
+    message: NATIVE_STAGE_MESSAGES[stageCode] ?? 'Optimizing production ratios.',
+    solver: 'native',
+    elapsedMs,
+  };
+}
 
 interface RatioOptimizerPayload {
   nodes: RatioOptimizerNode[];
@@ -466,6 +515,10 @@ let activeSolveProgress: ((progress: RatioSolverProgress) => void) | null = null
 let activeSolveRequestId: number | null = null;
 let nextSolveRequestId = 1;
 let warmupKey: string | null = null;
+let warmupWorker: Worker | null = null;
+let warmupPromise: Promise<void> | null = null;
+let resolveWarmup: (() => void) | null = null;
+let rejectWarmup: ((error: Error) => void) | null = null;
 const cancelledSolveRequestIds = new Set<number>();
 
 function finalizeActiveSolve(result: RatioOptimizerResult): void {
@@ -482,14 +535,24 @@ function finalizeActiveSolve(result: RatioOptimizerResult): void {
 function handleWorkerMessage(event: MessageEvent<RatioOptimizerWorkerMessage>): void {
   const message = event.data;
 
+  if (message.type === 'native-stage') {
+    if (message.requestId !== undefined && cancelledSolveRequestIds.has(message.requestId)) {
+      return;
+    }
+    if (activeSolveProgress && message.requestId === activeSolveRequestId) {
+      activeSolveProgress(nativeStageToProgress(message.stageCode, message.elapsedMs));
+    }
+    return;
+  }
+
   if (message.type === 'progress') {
     if (message.requestId !== undefined && cancelledSolveRequestIds.has(message.requestId)) {
       return;
     }
-    if (
-      activeSolveProgress &&
-      (message.requestId === undefined || message.requestId === activeSolveRequestId)
-    ) {
+    // Warmup progress is intentionally unscoped. Do not let a replacement
+    // Worker's warmup appear as progress for the next solve while that solve
+    // is waiting for warmup to finish.
+    if (activeSolveProgress && message.requestId === activeSolveRequestId) {
       activeSolveProgress(message.progress);
     }
     return;
@@ -497,10 +560,23 @@ function handleWorkerMessage(event: MessageEvent<RatioOptimizerWorkerMessage>): 
 
   if (message.type === 'warmup-result') {
     if (!message.feasible) {
+      const error = new Error(message.error ?? 'Worker warmup failed.');
       warmupKey = null;
+      warmupWorker = null;
+      warmupPromise = null;
+      const reject = rejectWarmup;
+      resolveWarmup = null;
+      rejectWarmup = null;
+      reject?.(error);
       console.warn('[Ratio Optimizer Service] Warmup failed:', message.error);
-    } else if (message.telemetry) {
-      console.info('[Ratio Optimizer Service] Warmup complete:', message.telemetry);
+    } else {
+      const resolve = resolveWarmup;
+      resolveWarmup = null;
+      rejectWarmup = null;
+      resolve?.();
+      if (import.meta.env.DEV && message.telemetry) {
+        console.info('[Ratio Optimizer Service] Warmup complete:', message.telemetry);
+      }
     }
     return;
   }
@@ -520,6 +596,12 @@ function handleWorkerError(err: ErrorEvent): void {
   console.error('[Ratio Optimizer Service] Worker thread error:', err);
   activeWorker = null;
   warmupKey = null;
+  warmupWorker = null;
+  warmupPromise = null;
+  const warmupReject = rejectWarmup;
+  resolveWarmup = null;
+  rejectWarmup = null;
+  warmupReject?.(new Error('Background worker thread encountered a runtime error.'));
   if (activeSolveInFlight) {
     finalizeActiveSolve({
       feasible: false,
@@ -544,21 +626,59 @@ function getOrCreateWorker(): Worker {
   return activeWorker;
 }
 
-export function initRatioOptimizerWorker(): void {
-  const worker = getOrCreateWorker();
-  if (typeof window === 'undefined') return;
+function ensureWorkerWarmup(worker: Worker): Promise<void> {
+  if (typeof window === 'undefined') return Promise.resolve();
 
   const scipBundlePath = getConfiguredScipBundlePath();
   const nextWarmupKey = `${window.location.origin}::${scipBundlePath}::${ASSET_VERSION}`;
-  if (warmupKey === nextWarmupKey) return;
+  if (warmupWorker === worker && warmupKey === nextWarmupKey && warmupPromise) {
+    return warmupPromise;
+  }
 
+  // A replacement Worker may be created while an older warmup promise is still
+  // pending. Reject the old promise so no solve can remain attached to a dead
+  // Worker indefinitely.
+  const previousReject = rejectWarmup;
+  resolveWarmup = null;
+  rejectWarmup = null;
+  warmupWorker = worker;
   warmupKey = nextWarmupKey;
-  worker.postMessage({
-    type: 'warmup',
-    origin: window.location.origin,
-    scipBundlePath,
-    version: ASSET_VERSION,
-  } satisfies RatioOptimizerWarmupRequest);
+  warmupPromise = new Promise<void>((resolve, reject) => {
+    resolveWarmup = resolve;
+    rejectWarmup = reject;
+  });
+  previousReject?.(new Error('SCIP Worker was replaced before warmup completed.'));
+
+  try {
+    worker.postMessage({
+      type: 'warmup',
+      origin: window.location.origin,
+      scipBundlePath,
+      version: ASSET_VERSION,
+    } satisfies RatioOptimizerWarmupRequest);
+  } catch (error) {
+    const warmupError =
+      error instanceof Error ? error : new Error('Failed to dispatch Worker warmup.');
+    warmupKey = null;
+    warmupWorker = null;
+    warmupPromise = null;
+    const reject = rejectWarmup as ((error: Error) => void) | null;
+    resolveWarmup = null;
+    rejectWarmup = null;
+    reject?.(warmupError);
+  }
+
+  return warmupPromise ?? Promise.reject(new Error('Failed to initialize SCIP Worker warmup.'));
+}
+
+export function initRatioOptimizerWorker(): void {
+  const worker = getOrCreateWorker();
+  void ensureWorkerWarmup(worker).catch((error: unknown) => {
+    console.warn(
+      '[Ratio Optimizer Service] Worker warmup unavailable:',
+      error instanceof Error ? error.message : String(error),
+    );
+  });
 }
 
 export function isRatioOptimizerRunning(): boolean {
@@ -567,11 +687,31 @@ export function isRatioOptimizerRunning(): boolean {
 
 export function cancelRatioOptimizer(): void {
   const requestId = activeSolveRequestId;
-  if (activeWorker && requestId !== null) {
+  if (activeSolveInFlight && activeWorker && requestId !== null) {
     cancelledSolveRequestIds.add(requestId);
-    activeWorker.postMessage({
-      type: 'cancel',
-      requestId,
+    const worker = activeWorker;
+    activeWorker = null;
+    warmupKey = null;
+    worker.onmessage = null;
+    worker.onerror = null;
+    worker.terminate();
+    // The handlers are detached before termination, so no stale event from this
+    // worker can be observed by the next worker. Avoid retaining cancelled IDs.
+    cancelledSolveRequestIds.delete(requestId);
+
+    // Keep cancellation isolated from the next request. The replacement is
+    // created and warmed now, rather than lazily when the next solve starts.
+    const replacementWorker = createWorker();
+    activeWorker = replacementWorker;
+    void ensureWorkerWarmup(replacementWorker).catch((error: unknown) => {
+      if (activeWorker === replacementWorker) {
+        activeWorker = null;
+        warmupKey = null;
+      }
+      console.warn(
+        '[Ratio Optimizer Service] Replacement Worker warmup unavailable:',
+        error instanceof Error ? error.message : String(error),
+      );
     });
   }
   if (activeSolveInFlight) {
@@ -588,6 +728,11 @@ if (typeof window !== 'undefined') {
       activeWorker.terminate();
       activeWorker = null;
     }
+    warmupKey = null;
+    warmupWorker = null;
+    warmupPromise = null;
+    resolveWarmup = null;
+    rejectWarmup = null;
   });
 }
 
@@ -636,28 +781,47 @@ export function solveRatios(
       elapsedMs: 0,
     });
 
-    try {
-      worker.postMessage({
-        type: 'solve',
-        requestId,
-        origin: window.location.origin,
-        scipBundlePath: getConfiguredScipBundlePath(),
-        nodes: payload.nodes,
-        connections: payload.connections,
-        objectiveWeights: resolveRatioObjectiveWeights(options.objectiveWeights),
-        optimizationConfiguration: options.optimizationConfiguration,
-        excludeAvoidableInfiniteCostMachines: options.excludeAvoidableInfiniteCostMachines,
-        version: ASSET_VERSION,
-      } satisfies RatioOptimizerRequest);
-    } catch (error) {
+    const postSolve = (): void => {
+      if (!activeSolveInFlight || activeSolveRequestId !== requestId || activeWorker !== worker) {
+        return;
+      }
+
+      try {
+        worker.postMessage({
+          type: 'solve',
+          requestId,
+          origin: window.location.origin,
+          scipBundlePath: getConfiguredScipBundlePath(),
+          nodes: payload.nodes,
+          connections: payload.connections,
+          objectiveWeights: resolveRatioObjectiveWeights(options.objectiveWeights),
+          optimizationConfiguration: options.optimizationConfiguration,
+          excludeAvoidableInfiniteCostMachines: options.excludeAvoidableInfiniteCostMachines,
+          version: ASSET_VERSION,
+        } satisfies RatioOptimizerRequest);
+      } catch (error) {
+        finalizeActiveSolve({
+          feasible: false,
+          error:
+            error instanceof Error
+              ? `Failed to dispatch ratio optimization request: ${error.message}`
+              : 'Failed to dispatch ratio optimization request.',
+        });
+      }
+    };
+
+    void ensureWorkerWarmup(worker).then(postSolve, (error: unknown) => {
+      if (!activeSolveInFlight || activeSolveRequestId !== requestId || activeWorker !== worker) {
+        return;
+      }
       finalizeActiveSolve({
         feasible: false,
         error:
           error instanceof Error
-            ? `Failed to dispatch ratio optimization request: ${error.message}`
-            : 'Failed to dispatch ratio optimization request.',
+            ? `Failed to warm up ratio optimizer Worker: ${error.message}`
+            : 'Failed to warm up ratio optimizer Worker.',
       });
-    }
+    });
   });
 
   return {

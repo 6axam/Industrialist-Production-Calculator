@@ -2,17 +2,15 @@
 
 This directory builds the single canonical solver bundle served from
 `public/scip/`. The bundle supports the fast staged ratio LP, exact rounded
-machine-cost/model-count objectives, recipe autocomplete, and native
+machine-cost/model-count objectives, recipe autocomplete, and Worker-level
 cancellation.
 
 ## Bundled Components
 
 - SCIP Optimization Suite 10.0.2.
 - SoPlex 8.0.2 from that suite.
-- PaPILO 3.0.0.
-- oneTBB 2021.13.0.
-- Emscripten 6.0.2 with pthreads, SCIP's TinyCThread task-processing interface,
-  and resizable WASM memory.
+- PaPILO 3.0.0 (optional; disabled by default for the serial Emscripten build).
+- Emscripten 6.0.2 with serial SCIP execution and resizable WASM memory.
 - The native wrapper in `industrialist_ratio_wrapper.cpp`.
 
 The build intentionally excludes GCG, UG, ZIMPL, GMP, MPFR, exact-LP support,
@@ -125,15 +123,15 @@ target. Flow-dependent fixed inputs can reference accepted flow on other inputs
 with exact linear coefficients. The Underground Waste Facility uses this to
 require concrete at 2% and lead at 1% of its combined accepted waste flow.
 
-## Native ABI 3
+## Native ABI 4
 
 The typed request and result formats use `Float64Array` buffers. The native
 capability bitset is `31`:
 
 - Bit 0: typed payload.
 - Bit 1: typed result.
-- Bit 2: asynchronous native job.
-- Bit 3: in-solver cancellation.
+- Bit 2: synchronous native solve.
+- Bit 3: native stage-progress bridge.
 - Bit 4: exact rounded-objective MILP.
 
 Request payload version 6 adds explicit machine lower/upper bounds, the
@@ -145,25 +143,16 @@ Result statuses are `optimal`, `cancelled`, `infeasible`, `unbounded`,
 `internal_error`. Only `optimal` results may be applied to the canvas.
 
 The JavaScript worker owns one warmed WASM runtime and serializes solve jobs.
-The native async job copies its payload before returning, runs on one Emscripten
-pthread, exposes stage progress, and is always joined before another job starts.
-Each rounded MILP model's initial SCIP search uses SCIP's concurrent solve API
-with a maximum of four cooperating SCIP solver threads (or fewer if the runtime
-cannot provide them). The later lexicographic lock stages reuse that model with
-ordinary SCIP solves because SCIP's concurrent API is not safely re-entered on
-the same mutable model under the threaded WASM TPI. This remains one
-coordinated solve of one model, not four independent application requests.
-Continuous LP stages continue to use the single-threaded SoPlex path.
-Wrapper-owned cancellation state is atomic; a separate volatile flag exists only
-for SoPlex's interrupt API. SCIP cancellation uses `SCIPinterruptSolve()` while a
-mutex protects the active SCIP pointer's lifetime. Cancelling does not terminate
-the browser worker or discard the WASM runtime.
+Each native solve is synchronous inside that browser Worker, while the native
+wrapper emits stage codes through a small Emscripten message bridge so the UI
+still receives staged progress. All SoPlex and SCIP stages use ordinary
+single-threaded solve calls. Rounded MILP tiers remain sequential and retain
+their fresh SCIP instances and lexicographic locks.
 
-Worker exceptions are converted to `internal_error` results instead of escaping
-the pthread entry point. Model data is moved into the active solver, the SoPlex
-engine is destroyed before a rounded SCIP solve begins, and completed result
-storage is released after JavaScript accepts it. If result-buffer allocation
-fails, the native result remains available for a later read.
+Cancellation terminates the browser Worker, discarding its active WASM runtime.
+The next request creates a fresh Worker and warms a new runtime. This keeps the
+UI cancellation contract immediate without native pthreads or in-solver
+interrupt state.
 
 ## Build
 
@@ -185,15 +174,16 @@ docker buildx build --load -t industrialist-scip-wasm -f tools/scip-wasm/Dockerf
 docker run --rm -e BUILD_JOBS=4 -v "%cd%:/workspace" industrialist-scip-wasm
 ```
 
-`BUILD_JOBS` caps compiler parallelism. Four jobs is a reliable default for
+`BUILD_JOBS` caps compiler parallelism only. Four jobs is a reliable default for
 Docker Desktop; increase it only when Docker has enough memory for concurrent
 PaPILO and SCIP translation units.
 
-The canonical defaults are already encoded in `build.sh`: PaPILO, oneTBB,
-SCIP TPI via TinyCThread, pthreads, a five-thread Emscripten pool (one native
-coordinator plus four SCIP solver threads), memory growth, and output to
+The canonical defaults are already encoded in `build.sh`: PaPILO disabled until
+its upstream package metadata supports the serial Emscripten toolchain, oneTBB
+disabled, no pthreads, serial SCIP execution, memory growth, and output to
 `/workspace/public/scip`. Environment overrides are intended only for isolated
-experiments.
+experiments; enabling `WITH_PAPILO=ON` currently fails fast if SCIP cannot link
+the package without Threads.
 
 The build emits:
 
@@ -207,13 +197,15 @@ public/scip/THIRD_PARTY_LICENSES.txt
 Emscripten 6.0.2 uses `scip.js` itself as the module-worker entrypoint, so this
 build does not emit a separate `scip.worker.js` file.
 
-It then runs shell LP/MILP tests plus ABI 3 regression tests against those exact
+It then runs shell LP/MILP tests plus ABI 4 regression tests against those exact
 emitted files. Coverage includes mixed target scales, tiny physical shortage,
 large-objective stage locks, exact and near-integer machine ceilings, a
 flow-forced ceiling just above an integer, rounded profile selection and support
 polishing, targetless power output, required and avoidable infinite-cost
-machines, autocomplete's finite-machine preference, cancellation, and repeated
-asynchronous solves for cleanup and state isolation. `VERSION.txt`
+machines, autocomplete's finite-machine preference, stage ordering, and repeated
+synchronous solves for cleanup and state isolation. Browser acceptance should
+cover Worker termination cancellation, immediate cancellation UI, stale-message
+protection, and successful reruns. `VERSION.txt`
 records component URLs, actual archive hashes, build flags, and native ABI
 version.
 `THIRD_PARTY_LICENSES.txt` is regenerated from the pinned solver and toolchain
@@ -224,19 +216,9 @@ image is pinned by manifest digest as well as version.
 
 ## Browser Requirements
 
-Pthread WASM requires `SharedArrayBuffer` and a cross-origin-isolated page. Every
-HTML/document response must include:
-
-```text
-Cross-Origin-Opener-Policy: same-origin
-Cross-Origin-Embedder-Policy: require-corp
-Cross-Origin-Resource-Policy: same-origin
-```
-
-Vite dev and preview headers are configured in `vite.config.ts`. Production
-hosting must set equivalent headers. Cross-origin images, scripts, workers, and
-iframes also need compatible CORS/CORP/COEP headers. The ratio worker reports a
-clear initialization error when isolation or ABI 3 capabilities are missing.
+The ratio optimizer runs in a dedicated browser Web Worker so synchronous WASM
+solver calls do not block the UI. Cross-origin isolation and
+`SharedArrayBuffer` are not required by the single-threaded bundle.
 
 ## Validation
 
@@ -249,7 +231,7 @@ node --check tools/scip-wasm/smoke-test.mjs
 ```
 
 The Docker build automatically runs native LP, rounded-MILP, typed ABI,
-cancellation, numerical-scaling, stage-lock, and repeated-lifecycle smoke tests
+numerical-scaling, stage-lock, stage-progress, and repeated-lifecycle smoke tests
 against the emitted bundle.
 
 Telemetry includes profile, status, per-stage objective/time, model dimensions,

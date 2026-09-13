@@ -210,7 +210,12 @@ export const boiler_standard: SpecialRecipe = {
         waterTemp,
       );
 
-      const steamQty = isBoiling ? 90 : helpers ? 0 : 90;
+      const hasRelevantConnection =
+        helpers?.hasConnection('input', 0) ||
+        helpers?.hasConnection('input', 1) ||
+        helpers?.hasConnection('output', 0) ||
+        helpers?.hasConnection('output', 1);
+      const steamQty = isBoiling ? 90 : hasRelevantConnection ? 0 : 90;
 
       const recipe: Recipe = {
         id: 'r_boiler_01',
@@ -246,7 +251,12 @@ export const boiler_standard: SpecialRecipe = {
     } else {
       const { boilerTemp, steamOutTemp, isBoiling } = computeSelfHeatingSteadyState(waterTemp);
 
-      const steamQty = isBoiling ? 90 : helpers ? 0 : 90;
+      const hasRelevantConnection =
+        helpers?.hasConnection('input', 0) ||
+        helpers?.hasConnection('input', 1) ||
+        helpers?.hasConnection('output', 0) ||
+        helpers?.hasConnection('output', 1);
+      const steamQty = isBoiling ? 90 : hasRelevantConnection ? 0 : 90;
 
       const recipe: Recipe = {
         id: 'r_boiler_01',

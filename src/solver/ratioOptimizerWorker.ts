@@ -2,6 +2,7 @@ import type {
   RatioDeficiencyCauseKind,
   RatioDeficientInputDiagnostic,
   RatioFailureDiagnostics,
+  RatioNativeFailureDiagnostics,
   RatioOptimizerConnection,
   RatioOptimizerNode,
   RatioOptimizerRequest,
@@ -67,17 +68,13 @@ interface SCIPWasmModule {
   _industrialist_free_result_buffer?: (ptr: number) => void;
   _industrialist_native_abi_version?: () => number;
   _industrialist_native_capabilities?: () => number;
-  _industrialist_start_ratio_job_f64?: (
+  _industrialist_solve_ratio_f64?: (
     payloadPtr: number,
     payloadDoubleCount: number,
     roundedMilpProfile: number,
+    requestId: number,
   ) => number;
-  _industrialist_get_ratio_job_state?: () => number;
-  _industrialist_get_ratio_job_stage?: () => number;
-  _industrialist_get_ratio_job_elapsed_ms?: () => number;
-  _industrialist_cancel_ratio_job?: () => number;
-  _industrialist_take_ratio_job_result?: () => number;
-  _industrialist_get_ratio_job_error?: () => number;
+  _industrialist_get_ratio_error?: () => number;
   HEAPF64?: Float64Array;
 }
 
@@ -101,14 +98,15 @@ interface NativeBinaryResult {
   machineCountsByNode: Float64Array;
   connectionFlows: Float64Array;
   inputDeficits: Float64Array;
+  nativeFailure?: RatioNativeFailureDiagnostics;
 }
 
 interface NativeRatioSolver {
   solveTypedPayloadResult: (
     payload: Float64Array,
+    requestId: number | undefined,
     progress?: ProgressReporter,
   ) => Promise<NativeBinaryResult | null> | NativeBinaryResult | null;
-  cancelActiveSolve?: () => boolean;
   getWasmMemoryBytes?: () => number | null;
 }
 
@@ -148,14 +146,15 @@ interface MPSRow {
 
 let runtimePromise: Promise<SCIPRuntime> | null = null;
 let runtimeKey: string | null = null;
-let activeRuntime: SCIPRuntime | null = null;
 const cancelledRequestIds = new Set<number>();
 let activeWorkerRequestId: number | undefined;
 
 const NATIVE_BINARY_RESULT_MAGIC = 444926465;
-const NATIVE_BINARY_RESULT_VERSION = 2;
+const NATIVE_BINARY_RESULT_VERSION = 3;
+const NATIVE_BINARY_RESULT_PREVIOUS_VERSION = 2;
 const NATIVE_BINARY_RESULT_LEGACY_VERSION = 1;
-const NATIVE_BINARY_RESULT_HEADER_DOUBLES = 28;
+const NATIVE_BINARY_RESULT_HEADER_DOUBLES = 38;
+const NATIVE_BINARY_RESULT_PREVIOUS_HEADER_DOUBLES = 28;
 const NATIVE_BINARY_RESULT_LEGACY_HEADER_DOUBLES = 20;
 const NATIVE_PAYLOAD_F64_MAGIC = 444926466;
 const NATIVE_PAYLOAD_F64_VERSION = 6;
@@ -165,7 +164,7 @@ const NATIVE_PAYLOAD_F64_INPUT_DOUBLES = 6;
 const NATIVE_PAYLOAD_F64_OUTPUT_DOUBLES = 2;
 const NATIVE_PAYLOAD_F64_CONNECTION_DOUBLES = 4;
 const NATIVE_PAYLOAD_F64_FLOW_DEPENDENCY_DOUBLES = 2;
-const NATIVE_ABI_V3_REQUIRED_CAPABILITIES = 31;
+const NATIVE_ABI_V4_REQUIRED_CAPABILITIES = 31;
 
 function getConfiguredRoundedMilpProfile(): RoundedMilpProfileCode {
   const profile = Number(import.meta.env.VITE_SCIP_ROUNDED_MILP_PROFILE ?? 0);
@@ -521,6 +520,36 @@ function getNativeBinaryStageLabel(stageCode: number): string {
   }
 }
 
+function getNativeFailureKind(kindCode: number): RatioNativeFailureDiagnostics['kind'] {
+  switch (kindCode) {
+    case 1:
+      return 'initial_infeasible';
+    case 2:
+      return 'objective_lock_infeasible';
+    case 3:
+      return 'rounded_machine_infeasible';
+    case 4:
+      return 'numeric_validation';
+    case 5:
+      return 'materialization_validation';
+    default:
+      return 'internal';
+  }
+}
+
+function getNativeFailureBackend(backendCode: number): RatioNativeFailureDiagnostics['backend'] {
+  switch (backendCode) {
+    case 1:
+      return 'soplex';
+    case 2:
+      return 'scip';
+    case 3:
+      return 'internal';
+    default:
+      return 'unknown';
+  }
+}
+
 function readNativeBinaryResultBuffer(scip: SCIPWasmModule, resultPtr: number): NativeBinaryResult {
   const heap = scip.HEAPF64;
   if (!heap) {
@@ -537,13 +566,19 @@ function readNativeBinaryResultBuffer(scip: SCIPWasmModule, resultPtr: number): 
   if (magic !== NATIVE_BINARY_RESULT_MAGIC) {
     throw new Error(`Native binary result magic mismatch: ${magic}.`);
   }
-  if (version !== NATIVE_BINARY_RESULT_VERSION && version !== NATIVE_BINARY_RESULT_LEGACY_VERSION) {
+  if (
+    version !== NATIVE_BINARY_RESULT_VERSION &&
+    version !== NATIVE_BINARY_RESULT_PREVIOUS_VERSION &&
+    version !== NATIVE_BINARY_RESULT_LEGACY_VERSION
+  ) {
     throw new Error(`Unsupported native binary result version: ${version}.`);
   }
   const headerDoubles =
     version === NATIVE_BINARY_RESULT_VERSION
       ? NATIVE_BINARY_RESULT_HEADER_DOUBLES
-      : NATIVE_BINARY_RESULT_LEGACY_HEADER_DOUBLES;
+      : version === NATIVE_BINARY_RESULT_PREVIOUS_VERSION
+        ? NATIVE_BINARY_RESULT_PREVIOUS_HEADER_DOUBLES
+        : NATIVE_BINARY_RESULT_LEGACY_HEADER_DOUBLES;
   if (
     !Number.isInteger(totalDoubles) ||
     totalDoubles < headerDoubles ||
@@ -555,10 +590,10 @@ function readNativeBinaryResultBuffer(scip: SCIPWasmModule, resultPtr: number): 
   const values = heap.slice(baseIndex, baseIndex + totalDoubles);
   const status = getNativeResultStatus(values[3]);
 
-  const stageCount = values[15];
-  const nodeCount = values[16];
-  const connectionCount = values[17];
-  const inputValueCount = values[18];
+  const stageCount = version === NATIVE_BINARY_RESULT_VERSION ? values[34] : values[15];
+  const nodeCount = version === NATIVE_BINARY_RESULT_VERSION ? values[35] : values[16];
+  const connectionCount = version === NATIVE_BINARY_RESULT_VERSION ? values[36] : values[17];
+  const inputValueCount = version === NATIVE_BINARY_RESULT_VERSION ? values[37] : values[18];
   if (
     !Number.isInteger(stageCount) ||
     stageCount < 0 ||
@@ -576,6 +611,18 @@ function readNativeBinaryResultBuffer(scip: SCIPWasmModule, resultPtr: number): 
   if (!Number.isSafeInteger(expectedDoubles) || expectedDoubles !== values.length) {
     throw new Error('Native binary result section lengths did not match the buffer length.');
   }
+
+  const nativeFailure =
+    version === NATIVE_BINARY_RESULT_VERSION && values[30] > 0
+      ? {
+          kind: getNativeFailureKind(values[30]),
+          stageCode: values[28],
+          stage: getNativeBinaryStageLabel(values[28]),
+          backend: getNativeFailureBackend(values[29]),
+          objectiveCode: values[31],
+          objectiveValue: Number.isFinite(values[32]) ? values[32] : undefined,
+        }
+      : undefined;
 
   let offset = headerDoubles;
   const stageTelemetry: RatioSolverStageTelemetry[] = [];
@@ -627,11 +674,14 @@ function readNativeBinaryResultBuffer(scip: SCIPWasmModule, resultPtr: number): 
           ? getRoundedMilpProfileLabel(values[26])
           : undefined,
       incumbentPolishMs: version === NATIVE_BINARY_RESULT_VERSION ? values[27] : undefined,
+      roundedMachineRepairCount: version === NATIVE_BINARY_RESULT_VERSION ? values[33] : undefined,
+      nativeFailure,
     },
     stageTelemetry,
     machineCountsByNode,
     connectionFlows,
     inputDeficits,
+    nativeFailure,
   };
 }
 
@@ -652,25 +702,24 @@ export function createNativeRatioSolver(
     return undefined;
   }
 
-  const canRunAsyncJob =
-    scip._industrialist_native_abi_version?.() === 3 &&
-    ((scip._industrialist_native_capabilities?.() ?? 0) & NATIVE_ABI_V3_REQUIRED_CAPABILITIES) ===
-      NATIVE_ABI_V3_REQUIRED_CAPABILITIES &&
-    typeof scip._industrialist_start_ratio_job_f64 === 'function' &&
-    typeof scip._industrialist_get_ratio_job_state === 'function' &&
-    typeof scip._industrialist_get_ratio_job_stage === 'function' &&
-    typeof scip._industrialist_get_ratio_job_elapsed_ms === 'function' &&
-    typeof scip._industrialist_cancel_ratio_job === 'function' &&
-    typeof scip._industrialist_take_ratio_job_result === 'function' &&
-    typeof scip._industrialist_get_ratio_job_error === 'function';
-  if (!canRunAsyncJob) return undefined;
+  const canRunSynchronousJob =
+    scip._industrialist_native_abi_version?.() === 4 &&
+    ((scip._industrialist_native_capabilities?.() ?? 0) & NATIVE_ABI_V4_REQUIRED_CAPABILITIES) ===
+      NATIVE_ABI_V4_REQUIRED_CAPABILITIES &&
+    typeof scip._industrialist_solve_ratio_f64 === 'function' &&
+    typeof scip._industrialist_get_ratio_error === 'function';
+  if (!canRunSynchronousJob) return undefined;
 
   const getWasmMemoryBytes = () => scip.HEAPF64?.buffer.byteLength ?? null;
 
   return {
     getWasmMemoryBytes,
-    cancelActiveSolve: () => scip._industrialist_cancel_ratio_job!() === 1,
-    solveTypedPayloadResult: async (payload: Float64Array, progress?: ProgressReporter) => {
+    solveTypedPayloadResult: async (
+      payload: Float64Array,
+      requestId: number | undefined,
+      progress?: ProgressReporter,
+    ) => {
+      void progress;
       const byteLength = payload.byteLength;
       let payloadPtr = scip._malloc!(byteLength);
       if (!payloadPtr) {
@@ -689,49 +738,16 @@ export function createNativeRatioSolver(
 
         heap.set(payload, payloadPtr / Float64Array.BYTES_PER_ELEMENT);
 
-        const started = scip._industrialist_start_ratio_job_f64!(
+        resultPtr = scip._industrialist_solve_ratio_f64!(
           payloadPtr,
           payload.length,
           roundedMilpProfile,
+          requestId ?? -1,
         );
-        if (started !== 1) {
-          throw new Error('Native ratio solver could not start an asynchronous job.');
-        }
         scip._free!(payloadPtr);
         payloadPtr = 0;
 
-        let lastStage = -1;
-        while (true) {
-          const state = scip._industrialist_get_ratio_job_state!();
-          const stage = scip._industrialist_get_ratio_job_stage!();
-          if (stage !== lastStage) {
-            lastStage = stage;
-            const stageMessages: Record<number, string> = {
-              0: 'Preparing the optimization model.',
-              1: 'Satisfying connected-input shortages.',
-              2: 'Balancing excess routed into sinks.',
-              3: 'Optimizing Priority 1.',
-              4: 'Optimizing Priority 2.',
-              5: 'Optimizing Priority 3.',
-              6: 'Reducing the final machine count.',
-              7: 'Finalizing the optimized ratios.',
-            };
-            progress?.({
-              phase: stage > 6 ? 'finalizing' : stage === 0 ? 'building' : 'solving',
-              message: stageMessages[stage] ?? 'Optimizing production ratios.',
-              solver: 'native',
-              elapsedMs: scip._industrialist_get_ratio_job_elapsed_ms!(),
-            });
-          }
-
-          if (state === 2) break;
-          if (state !== 1) {
-            throw new Error(`Native ratio job entered unexpected state ${state}.`);
-          }
-          await new Promise<void>((resolve) => setTimeout(resolve, 16));
-        }
-
-        const errorPtr = scip._industrialist_get_ratio_job_error!();
+        const errorPtr = scip._industrialist_get_ratio_error!();
         let nativeError = '';
         try {
           if (errorPtr) nativeError = scip.UTF8ToString!(errorPtr);
@@ -739,12 +755,14 @@ export function createNativeRatioSolver(
           if (errorPtr) scip._industrialist_free_string!(errorPtr);
         }
 
-        resultPtr = scip._industrialist_take_ratio_job_result!();
         if (!resultPtr) {
-          throw new Error(nativeError || 'Native ratio job returned no result buffer.');
+          throw new Error(nativeError || 'Native ratio solver returned no result buffer.');
         }
         const result = readNativeBinaryResultBuffer(scip, resultPtr);
-        if (nativeError) result.error = nativeError;
+        if (nativeError) {
+          result.error = nativeError;
+          if (result.nativeFailure) result.nativeFailure.detail = nativeError;
+        }
         return result;
       } finally {
         if (resultPtr) {
@@ -762,18 +780,10 @@ async function getOrCreateRuntime(
   version?: string,
   progress?: ProgressReporter,
 ): Promise<SCIPRuntime> {
-  if (typeof SharedArrayBuffer === 'undefined' || globalThis.crossOriginIsolated !== true) {
-    throw new Error(
-      'The native ratio solver requires cross-origin isolation. Serve the app with ' +
-        'Cross-Origin-Opener-Policy: same-origin and ' +
-        'Cross-Origin-Embedder-Policy: require-corp.',
-    );
-  }
   const bundlePath = normalizeScipBundlePath(requestedBundlePath);
   const nextKey = getRuntimeKey(origin, bundlePath, version);
   if (runtimePromise && runtimeKey === nextKey) {
     const runtime = await runtimePromise;
-    activeRuntime = runtime;
     runtime.initializedDuringLastRequest = false;
     return runtime;
   }
@@ -794,7 +804,7 @@ async function getOrCreateRuntime(
     const stdoutLines: string[] = [];
     progress?.({
       phase: 'loading',
-      message: 'Instantiating SCIP WASM runtime and worker pool.',
+      message: 'Instantiating single-threaded SCIP WASM runtime.',
       solver: 'unknown',
       elapsedMs: performance.now() - initStart,
     });
@@ -809,9 +819,9 @@ async function getOrCreateRuntime(
     })) as SCIPWasmModule;
     const roundedMilpProfile = getConfiguredRoundedMilpProfile();
     const nativeRatioSolver = createNativeRatioSolver(scip, roundedMilpProfile);
-    if (!nativeRatioSolver?.solveTypedPayloadResult || !nativeRatioSolver.cancelActiveSolve) {
+    if (!nativeRatioSolver?.solveTypedPayloadResult) {
       throw new Error(
-        'The canonical SCIP bundle is missing native ABI v3 capabilities. ' +
+        'The canonical SCIP bundle is missing native ABI v4 capabilities. ' +
           'Rebuild public/scip from tools/scip-wasm before running the ratio optimizer.',
       );
     }
@@ -837,13 +847,11 @@ async function getOrCreateRuntime(
 
   try {
     const runtime = await runtimePromise;
-    activeRuntime = runtime;
     runtime.initializedDuringLastRequest = true;
     return runtime;
   } catch (error) {
     runtimePromise = null;
     runtimeKey = null;
-    activeRuntime = null;
     throw error;
   }
 }
@@ -968,19 +976,13 @@ export function buildMPS(
     }
   }
 
-  const addFlowPollutionTerms = (
-    expression: Map<string, number>,
-    coefficientScale: number,
-  ) => {
+  const addFlowPollutionTerms = (expression: Map<string, number>, coefficientScale: number) => {
     for (const node of nodes) {
       for (let inputIndex = 0; inputIndex < node.inputs.length; inputIndex += 1) {
         const pollutionPerFlow = node.inputs[inputIndex].pollutionPerFlow;
         if (!Number.isFinite(pollutionPerFlow) || pollutionPerFlow === 0) continue;
         for (const connection of connections) {
-          if (
-            connection.targetNodeId !== node.id ||
-            connection.targetInputIndex !== inputIndex
-          ) {
+          if (connection.targetNodeId !== node.id || connection.targetInputIndex !== inputIndex) {
             continue;
           }
           const flowVar = edgeFlowVars.get(connection.id);
@@ -1472,6 +1474,16 @@ function buildResponseFromNativeBinaryResult(
   );
 }
 
+function getNativeFailureMessage(binaryResult: NativeBinaryResult): string {
+  const failure = binaryResult.nativeFailure;
+  if (!failure)
+    return (
+      binaryResult.error || `Native ratio solver stopped with status '${binaryResult.status}'.`
+    );
+  const detail = binaryResult.error ? ` ${binaryResult.error}` : '';
+  return `Native ratio solve failed during ${failure.stage} (${failure.kind}).${detail}`;
+}
+
 async function solveRatioStagesNative(
   runtime: SCIPRuntime,
   nodes: RatioOptimizerNode[],
@@ -1482,6 +1494,7 @@ async function solveRatioStagesNative(
   progress?: ProgressReporter,
   resultNodes = nodes,
   resultConnections = connections,
+  requestId?: number,
 ): Promise<RatioOptimizerResponse> {
   if (!runtime.nativeRatioSolver) {
     throw new Error('The native ratio optimizer is unavailable.');
@@ -1509,25 +1522,16 @@ async function solveRatioStagesNative(
     solver: 'native',
   });
   const nativeCallStart = performance.now();
-  const binaryResult = await runtime.nativeRatioSolver.solveTypedPayloadResult(payload, progress);
+  const binaryResult = await runtime.nativeRatioSolver.solveTypedPayloadResult(
+    payload,
+    requestId,
+    progress,
+  );
   const nativeCallMs = performance.now() - nativeCallStart;
   if (!binaryResult) {
     throw new Error('Native ratio solver failed before returning a typed result.');
   }
-  if (binaryResult.status !== 'optimal') {
-    if (binaryResult.status === 'cancelled') {
-      throw new Error('Computation cancelled.');
-    }
-    throw new Error(
-      binaryResult.error || `Native ratio solver stopped with status '${binaryResult.status}'.`,
-    );
-  }
 
-  progress?.({
-    phase: 'finalizing',
-    message: 'Finalizing native solver result.',
-    solver: 'native',
-  });
   const fallbackTelemetry: RatioSolverTelemetry = {
     solver: 'native',
     bundlePath: runtime.bundlePath,
@@ -1540,6 +1544,28 @@ async function solveRatioStagesNative(
     nativeCallMs,
     wasmMemoryBytes: runtime.nativeRatioSolver.getWasmMemoryBytes?.() ?? undefined,
   };
+  if (binaryResult.status !== 'optimal') {
+    if (binaryResult.status === 'cancelled') {
+      throw new Error('Computation cancelled.');
+    }
+    return {
+      feasible: false,
+      error: getNativeFailureMessage(binaryResult),
+      nativeFailure: binaryResult.nativeFailure,
+      telemetry: {
+        ...fallbackTelemetry,
+        ...binaryResult.telemetry,
+        nativeStatus: binaryResult.status,
+        stageTelemetry: binaryResult.stageTelemetry,
+      },
+    };
+  }
+
+  progress?.({
+    phase: 'finalizing',
+    message: 'Finalizing native solver result.',
+    solver: 'native',
+  });
   const parseStart = performance.now();
   const response = buildResponseFromNativeBinaryResult(
     binaryResult,
@@ -1549,6 +1575,7 @@ async function solveRatioStagesNative(
     resultNodes,
     fallbackTelemetry,
   );
+  response.nativeFailure = binaryResult.nativeFailure;
   response.telemetry = {
     ...fallbackTelemetry,
     ...response.telemetry,
@@ -1567,6 +1594,7 @@ export async function solveRatioStages(
   configuration?: OptimizationConfiguration,
   excludeAvoidableInfiniteCostMachines = false,
   progress?: ProgressReporter,
+  requestId?: number,
 ): Promise<RatioOptimizerResponse> {
   const resolvedConfiguration = configuration
     ? sanitizeOptimizationConfiguration(configuration)
@@ -1602,6 +1630,7 @@ export async function solveRatioStages(
     progress,
     nodes,
     connections,
+    requestId,
   );
 
   attachPresolveTelemetry(response, presolved.stats);
@@ -1746,6 +1775,7 @@ async function handleSolveMessage(message: RatioOptimizerRequest): Promise<void>
       message.optimizationConfiguration,
       message.excludeAvoidableInfiniteCostMachines,
       progress,
+      requestId,
     );
     throwIfCancelled(requestId);
     response.type = 'solve-result';
@@ -1800,9 +1830,6 @@ let workerMessageQueue = Promise.resolve();
 const handleRatioOptimizerMessage = (event: MessageEvent<RatioOptimizerWorkerRequest>) => {
   if (event.data.type === 'cancel') {
     cancelledRequestIds.add(event.data.requestId);
-    if (activeWorkerRequestId === event.data.requestId) {
-      activeRuntime?.nativeRatioSolver?.cancelActiveSolve?.();
-    }
     return;
   }
 

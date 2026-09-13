@@ -7,24 +7,31 @@
 #include <soplex.h>
 
 #include <algorithm>
-#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iomanip>
 #include <limits>
-#include <mutex>
 #include <new>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
+
+EM_JS(void, industrialist_post_native_stage, (int request_id, int stage_code, double elapsed_ms), {
+  if (typeof self === 'undefined' || typeof self.postMessage !== 'function') return;
+  const message = {
+    type: 'native-stage',
+    stageCode: stage_code,
+    elapsedMs: elapsed_ms,
+  };
+  if (request_id >= 0) message.requestId = request_id;
+  self.postMessage(message);
+});
 
 namespace {
 
@@ -38,8 +45,9 @@ constexpr double kMachineIntegerRelativeTolerance =
   std::numeric_limits<double>::epsilon() * 8.0;
 constexpr double kZeroRateConnectionEpsilon = 1e-12;
 constexpr double kBinaryResultMagic = 444926465.0; // "IRLP" as an exact small integer marker.
-constexpr double kBinaryResultVersion = 2.0;
-constexpr int kBinaryResultHeaderDoubles = 28;
+constexpr double kBinaryResultVersion = 3.0;
+// v3 adds structured failure metadata and the rounded-machine repair count.
+constexpr int kBinaryResultHeaderDoubles = 38;
 constexpr double kBinaryPayloadMagic = 444926466.0;
 constexpr double kBinaryPayloadVersion = 6.0;
 constexpr int kBinaryPayloadHeaderDoubles = 41;
@@ -221,8 +229,6 @@ struct SolveOptions {
   bool configurePresolving = false;
   bool configureHeuristics = false;
   bool preferDownwardIntegerBranching = false;
-  bool useConcurrentSolve = false;
-  int maxSolveThreads = 4;
   double timeLimitSeconds = -1.0;
   SCIP_Longint nodeLimit = -1;
 };
@@ -251,7 +257,13 @@ struct SolveTelemetry {
   double mipGap = 0.0;
   int roundedVariableCount = 0;
   int roundedMilpProfile = -1;
+  int roundedMachineRepairCount = 0;
   double incumbentPolishMs = 0.0;
+  int failureStageCode = -1;
+  int failureBackendCode = 0;
+  int failureKindCode = 0;
+  int failureObjectiveCode = -1;
+  double failureObjectiveValue = 0.0;
   std::vector<StageTelemetry> stages;
 };
 
@@ -265,23 +277,31 @@ struct NativeSolveResult {
 };
 
 struct SolveControl {
-  volatile bool* interruptFlag = nullptr;
-  std::atomic<bool>* cancellationRequested = nullptr;
-  std::atomic<int>* stageCode = nullptr;
-  std::atomic<SCIP*>* activeScip = nullptr;
-  std::mutex* activeScipMutex = nullptr;
+  int requestId = -1;
+  int stageCode = -1;
+  std::chrono::steady_clock::time_point startedAt;
 };
 
-bool isCancellationRequested(const SolveControl* control) {
-  return control != nullptr &&
-    control->cancellationRequested != nullptr &&
-    control->cancellationRequested->load(std::memory_order_acquire);
-}
+enum NativeFailureKind {
+  FailureNone = 0,
+  FailureInitialInfeasible = 1,
+  FailureObjectiveLockInfeasible = 2,
+  FailureRoundedMachineInfeasible = 3,
+  FailureNumericValidation = 4,
+  FailureMaterializationValidation = 5,
+  FailureInternal = 6,
+};
 
 void setSolveStage(SolveControl* control, int stageCode) {
-  if (control != nullptr && control->stageCode != nullptr) {
-    control->stageCode->store(stageCode, std::memory_order_release);
-  }
+  if (control == nullptr || control->stageCode == stageCode) return;
+  control->stageCode = stageCode;
+  industrialist_post_native_stage(
+    control->requestId,
+    stageCode,
+    std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - control->startedAt
+    ).count()
+  );
 }
 
 struct ScipHolder {
@@ -1478,23 +1498,6 @@ bool applySolveOptions(SCIP* scip, const SolveOptions& options, std::string& err
     }
   }
 
-  if (options.useConcurrentSolve) {
-    if (!checkScip(
-          SCIPsetIntParam(scip, "parallel/maxnthreads", options.maxSolveThreads),
-          "Set SCIP maximum concurrent solve threads",
-          error
-        )) {
-      return false;
-    }
-    if (!checkScip(
-          SCIPsetIntParam(scip, "parallel/minnthreads", 1),
-          "Set SCIP minimum concurrent solve threads",
-          error
-        )) {
-      return false;
-    }
-  }
-
   if (options.timeLimitSeconds >= 0.0 &&
       !checkScip(
         SCIPsetRealParam(scip, "limits/time", options.timeLimitSeconds),
@@ -1596,7 +1599,6 @@ class StagedLpEngine {
   const ModelSpec& model() const { return activeModel_; }
   ModelSpec takeModel() { return std::move(activeModel_); }
   void reportStage(int stageCode) { setSolveStage(control_, stageCode); }
-  bool isCancelled() const { return isCancellationRequested(control_); }
   virtual std::string profileName() const = 0;
   virtual bool initialize(std::string& error) = 0;
   virtual bool solveStage(
@@ -1726,15 +1728,9 @@ class SoplexStagedLpEngine final : public StagedLpEngine {
         solver_.changeObjReal(i, getObjectiveCoeff(activeModel_.vars[static_cast<size_t>(i)], objective));
       }
 
-      const int status = static_cast<int>(solver_.optimize(
-        control_ != nullptr ? control_->interruptFlag : nullptr
-      ));
+      const int status = static_cast<int>(solver_.optimize(nullptr));
       totalLpIterations_ += static_cast<double>(solver_.numIterations());
       if (status != soplex::SPxSolver::OPTIMAL) {
-        if (isCancellationRequested(control_)) {
-          error = "CANCELLED";
-          return false;
-        }
         if (status == soplex::SPxSolver::UNBOUNDED) {
           error = "UNBOUNDED";
           return false;
@@ -1817,9 +1813,7 @@ class ReusableScipStagedLpEngine final : public StagedLpEngine {
     SolveControl* control = nullptr
   ) : StagedLpEngine(std::move(model), control), options_(options) {}
 
-  ~ReusableScipStagedLpEngine() override {
-    clearActiveScip();
-  }
+  ~ReusableScipStagedLpEngine() override = default;
 
   std::string profileName() const override {
     return std::string("reusable_scip_") + options_.profileName;
@@ -1935,20 +1929,10 @@ class ReusableScipStagedLpEngine final : public StagedLpEngine {
   ) {
     const auto stageStart = std::chrono::steady_clock::now();
     found = false;
-    if (isCancellationRequested(control_)) {
-      error = "CANCELLED";
-      return false;
-    }
-    if (!setObjective(objective, error) || !publishActiveScip(error)) return false;
+    if (!setObjective(objective, error)) return false;
 
     const SCIP_RETCODE solveRetcode = solveScip();
-    clearActiveScip();
     if (!checkScip(solveRetcode, "Search for SCIP incumbent", error)) return false;
-    if (SCIPgetStatus(holder_.scip) == SCIP_STATUS_USERINTERRUPT ||
-        isCancellationRequested(control_)) {
-      error = "CANCELLED";
-      return false;
-    }
 
     SCIP_SOL* bestSol = SCIPgetBestSol(holder_.scip);
     if (bestSol != nullptr) {
@@ -1966,23 +1950,13 @@ class ReusableScipStagedLpEngine final : public StagedLpEngine {
     std::string& error
   ) override {
     const auto stageStart = std::chrono::steady_clock::now();
-    if (isCancellationRequested(control_)) {
-      error = "CANCELLED";
-      return false;
-    }
     if (!setObjective(objective, error)) return false;
 
-    if (!publishActiveScip(error)) return false;
     const SCIP_RETCODE solveRetcode = solveScip();
-    clearActiveScip();
     if (!checkScip(solveRetcode, "Solve reusable SCIP stage", error)) return false;
 
     const SCIP_STATUS status = SCIPgetStatus(holder_.scip);
     if (status != SCIP_STATUS_OPTIMAL) {
-      if (status == SCIP_STATUS_USERINTERRUPT || isCancellationRequested(control_)) {
-        error = "CANCELLED";
-        return false;
-      }
       if (status == SCIP_STATUS_INFEASIBLE || status == SCIP_STATUS_INFORUNBD) {
         error = "INFEASIBLE";
         return false;
@@ -2091,54 +2065,12 @@ class ReusableScipStagedLpEngine final : public StagedLpEngine {
     return true;
   }
 
-  bool publishActiveScip(std::string& error) {
-    if (control_ == nullptr || control_->activeScip == nullptr) {
-      if (isCancellationRequested(control_)) {
-        error = "CANCELLED";
-        return false;
-      }
-      return true;
-    }
-
-    if (control_->activeScipMutex != nullptr) {
-      std::lock_guard<std::mutex> lock(*control_->activeScipMutex);
-      if (isCancellationRequested(control_)) {
-        error = "CANCELLED";
-        return false;
-      }
-      control_->activeScip->store(holder_.scip, std::memory_order_release);
-      return true;
-    }
-
-    if (isCancellationRequested(control_)) {
-      error = "CANCELLED";
-      return false;
-    }
-    control_->activeScip->store(holder_.scip, std::memory_order_release);
-    return true;
-  }
-
-  void clearActiveScip() {
-    if (control_ == nullptr || control_->activeScip == nullptr) return;
-    if (control_->activeScipMutex != nullptr) {
-      std::lock_guard<std::mutex> lock(*control_->activeScipMutex);
-      control_->activeScip->store(nullptr, std::memory_order_release);
-      return;
-    }
-    control_->activeScip->store(nullptr, std::memory_order_release);
-  }
-
   SCIP_RETCODE solveScip() {
-    if (options_.useConcurrentSolve && !concurrentSolveUsed_) {
-      concurrentSolveUsed_ = true;
-      return SCIPsolveConcurrent(holder_.scip);
-    }
     return SCIPsolve(holder_.scip);
   }
 
   SolveOptions options_;
   ScipHolder holder_;
-  bool concurrentSolveUsed_ = false;
   double mipNodeCount_ = 0.0;
   double lpIterations_ = 0.0;
   double primalBound_ = 0.0;
@@ -2161,8 +2093,6 @@ RoundedMilpProfile getRoundedMilpProfile(int profileCode) {
 
 SolveOptions getRoundedMilpSolveOptions(RoundedMilpProfile profile) {
   SolveOptions options;
-  options.useConcurrentSolve = true;
-  options.maxSolveThreads = 4;
   options.preferDownwardIntegerBranching =
     profile == RoundedMilpProfile::Tuned || profile == RoundedMilpProfile::TunedWithoutPolish;
   if (profile == RoundedMilpProfile::Legacy) {
@@ -2183,8 +2113,6 @@ SolveOptions getRoundedMilpSolveOptions(RoundedMilpProfile profile) {
 
 SolveOptions getIncumbentPolishOptions() {
   SolveOptions options;
-  options.useConcurrentSolve = true;
-  options.maxSolveThreads = 4;
   options.profileName = "rounded_incumbent_polish";
   options.emphasis = SCIP_PARAMEMPHASIS_FEASIBILITY;
   options.presolving = SCIP_PARAMSETTING_FAST;
@@ -2468,7 +2396,7 @@ bool buildRoundedMilpModel(
     addRowTerm(
       linkingRow,
       machineVarIndex,
-      machineScale * (1.0 - kMachineIntegerRelativeTolerance)
+      machineScale
     );
     addRowTerm(linkingRow, roundedVarIndex, -1.0);
     milpModel.rows.push_back(std::move(linkingRow));
@@ -2482,7 +2410,7 @@ bool buildRoundedMilpModel(
     addRowTerm(
       ceilingBandRow,
       machineVarIndex,
-      machineScale * (1.0 - kMachineIntegerRelativeTolerance)
+      machineScale
     );
     addRowTerm(ceilingBandRow, roundedVarIndex, -1.0);
     milpModel.rows.push_back(std::move(ceilingBandRow));
@@ -2573,9 +2501,6 @@ bool polishRoundedIncumbent(
     }
 
     SolveOptions polishOptions = getIncumbentPolishOptions();
-    if (restrictedModel.infiniteMachineCostTier > 0) {
-      polishOptions.useConcurrentSolve = false;
-    }
     ReusableScipStagedLpEngine engine(
       std::move(restrictedModel), polishOptions, control
     );
@@ -2584,10 +2509,6 @@ bool polishRoundedIncumbent(
         !engine.activateDeferredLimits(polishError) ||
         !engine.addStartSolution(restrictedStart, polishError)) {
       telemetry.incumbentPolishMs = elapsedMilliseconds(polishStart);
-      if (isCancellationRequested(control)) {
-        error = "CANCELLED";
-        return false;
-      }
       return true;
     }
 
@@ -2595,10 +2516,6 @@ bool polishRoundedIncumbent(
     bool found = false;
     if (!engine.findIncumbent(ObjectiveMode::Tier1, polished, found, polishError)) {
       telemetry.incumbentPolishMs = elapsedMilliseconds(polishStart);
-      if (polishError == "CANCELLED" || isCancellationRequested(control)) {
-        error = "CANCELLED";
-        return false;
-      }
       return true;
     }
 
@@ -2620,7 +2537,8 @@ bool polishRoundedIncumbent(
 bool normalizeRoundedMachineVariables(
   const ModelSpec& model,
   StageSolution& solution,
-  std::string& error
+  std::string& error,
+  int& repairCount
 ) {
   if (solution.values.size() != model.vars.size()) {
     error = "Rounded machine normalization requires a complete MILP solution.";
@@ -2653,16 +2571,16 @@ bool normalizeRoundedMachineVariables(
     }
     const double solvedRoundedCount = solution.values[static_cast<size_t>(roundedVarIndex)];
     if (solvedRoundedCount + kIntegralityTolerance < exactRoundedCount) {
-      std::ostringstream out;
-      out << std::setprecision(17)
-          << "SCIP undercounted whole-machine variable " << roundedVar.name
-          << " as " << solvedRoundedCount
-          << " for physical machine count " << physicalMachineCount
-          << "; expected " << exactRoundedCount << ".";
-      error = out.str();
-      return false;
+      // SCIP can accept a value on the wrong side of the integrality boundary
+      // when the linking row is within its feasibility tolerance. The
+      // canonical whole-machine count is still unambiguous, so repair the
+      // integer output before validating the complete solution. This keeps a
+      // solver tolerance artifact from reaching the frontend as an undercount.
+      solution.values[static_cast<size_t>(roundedVarIndex)] = exactRoundedCount;
+      repairCount += 1;
+    } else {
+      solution.values[static_cast<size_t>(roundedVarIndex)] = exactRoundedCount;
     }
-    solution.values[static_cast<size_t>(roundedVarIndex)] = exactRoundedCount;
   }
 
   solution.objectiveValue = recomputeObjectiveValue(
@@ -2734,18 +2652,9 @@ bool solveAllStagesWithRoundedMilp(
   tightenRoundedModelFromIncumbent(milpModel, startValues, incumbentObjective);
 
   SolveOptions options = getRoundedMilpSolveOptions(profile);
-  // Infinite-cost preference probes depend on mutable SCIP state and remain
-  // on the conservative sequential path until fresh-instance handling for
-  // that special objective is validated independently.
-  if (milpModel.infiniteMachineCostTier > 0) {
-    options.useConcurrentSolve = false;
-  }
-
   // Every lexicographic MILP stage depends on the exact bound locked by the
-  // preceding stage, so the stages remain sequential.  Each stage now gets a
-  // fresh SCIP instance, however, which lets SCIPsolveConcurrent() safely use
-  // up to four solver threads for every ordinary rounded stage instead of
-  // re-entering concurrent solving on one mutable SCIP model.
+  // preceding stage, so the stages remain sequential. Each stage gets a fresh
+  // SCIP instance and uses the ordinary single-threaded solve API.
   ModelSpec stagedMilpModel = std::move(milpModel);
   std::vector<double> stagedStartValues = std::move(startValues);
   const ObjectiveMode tierModes[] = {ObjectiveMode::Tier1, ObjectiveMode::Tier2, ObjectiveMode::Tier3};
@@ -2806,7 +2715,9 @@ bool solveAllStagesWithRoundedMilp(
       finalSolution.objectiveValue,
       finalSolution.elapsedMs,
     });
-    if (!normalizeRoundedMachineVariables(finalEngine.model(), finalSolution, error)) {
+    if (!normalizeRoundedMachineVariables(
+          finalEngine.model(), finalSolution, error, telemetry.roundedMachineRepairCount
+        )) {
       error = "Normalize exact rounded machine counts failed: " + error;
       return false;
     }
@@ -2934,6 +2845,16 @@ std::vector<double> buildBinarySolutionValues(
     ? static_cast<double>(telemetry.roundedMilpProfile + 10)
     : 0.0;
   out[27] = telemetry.incumbentPolishMs;
+  out[28] = static_cast<double>(telemetry.failureStageCode);
+  out[29] = static_cast<double>(telemetry.failureBackendCode);
+  out[30] = static_cast<double>(telemetry.failureKindCode);
+  out[31] = static_cast<double>(telemetry.failureObjectiveCode);
+  out[32] = telemetry.failureObjectiveValue;
+  out[33] = static_cast<double>(telemetry.roundedMachineRepairCount);
+  out[34] = static_cast<double>(telemetry.stages.size());
+  out[35] = static_cast<double>(machineEntryCount);
+  out[36] = static_cast<double>(flowEntryCount);
+  out[37] = static_cast<double>(inputEntryCount);
 
   size_t offset = static_cast<size_t>(kBinaryResultHeaderDoubles);
   for (const StageTelemetry& stage : telemetry.stages) {
@@ -2967,11 +2888,6 @@ bool solveNativePayloadStructured(
   SolveControl* control = nullptr
 ) {
   setSolveStage(control, 0);
-  if (isCancellationRequested(control)) {
-    result.status = NativeResultStatus::Cancelled;
-    result.error = "Computation cancelled.";
-    return false;
-  }
   std::string validationError;
   if (!validateNativeInput(input, validationError)) {
     result.status = NativeResultStatus::InvalidPayload;
@@ -3002,11 +2918,6 @@ bool solveNativePayloadStructured(
         std::move(model), finalSolution, finalModel, telemetry, attemptError, control
       );
   if (solved) {
-    if (isCancellationRequested(control)) {
-      result.status = NativeResultStatus::Cancelled;
-      result.error = "Computation cancelled.";
-      return false;
-    }
     result.ok = true;
     result.status = NativeResultStatus::Optimal;
     result.model = std::move(finalModel);
@@ -3015,14 +2926,32 @@ bool solveNativePayloadStructured(
     return true;
   }
 
-  if (isCancellationRequested(control) || attemptError.find("CANCELLED") != std::string::npos) {
-    result.status = NativeResultStatus::Cancelled;
-    result.error = "Computation cancelled.";
-    return false;
+  telemetry.failureStageCode = control != nullptr ? control->stageCode : -1;
+  telemetry.failureObjectiveCode = telemetry.failureStageCode;
+  telemetry.failureBackendCode = hasRoundedObjective && telemetry.failureStageCode >= 3 ? 2 : 1;
+  if (!telemetry.stages.empty()) {
+    telemetry.failureObjectiveValue = telemetry.stages.back().objectiveValue;
   }
   if (attemptError.find("INFEASIBLE") != std::string::npos) {
+    telemetry.failureKindCode = telemetry.stages.empty()
+      ? FailureInitialInfeasible
+      : (hasRoundedObjective && telemetry.failureStageCode >= 3
+          ? FailureRoundedMachineInfeasible
+          : FailureObjectiveLockInfeasible);
+  } else if (
+    attemptError.find("validation") != std::string::npos ||
+    attemptError.find("undercounted") != std::string::npos ||
+    attemptError.find("normalization") != std::string::npos
+  ) {
+    telemetry.failureKindCode = FailureNumericValidation;
+  } else {
+    telemetry.failureKindCode = FailureInternal;
+  }
+  result.telemetry = std::move(telemetry);
+
+  if (attemptError.find("INFEASIBLE") != std::string::npos) {
     result.status = NativeResultStatus::Infeasible;
-    result.error = "Native ratio model is infeasible.";
+    result.error = "Native ratio model is infeasible. " + attemptError;
     return false;
   }
   if (attemptError.find("UNBOUNDED") != std::string::npos) {
@@ -3069,166 +2998,58 @@ bool solveNativeArrayPayloadStructured(
 }
 
 
-enum class NativeJobState {
-  Idle = 0,
-  Running = 1,
-  Complete = 2,
-};
+std::string g_nativeError;
 
-struct NativeAsyncJob {
-  std::mutex mutex;
-  std::condition_variable condition;
-  std::thread worker;
-  std::atomic<int> state{ static_cast<int>(NativeJobState::Idle) };
-  std::atomic<int> stageCode{ 0 };
-  std::atomic<SCIP*> activeScip{ nullptr };
-  std::atomic<bool> cancellationRequested{ false };
-  volatile bool soplexInterruptFlag = false;
-  std::chrono::steady_clock::time_point startedAt;
-  std::vector<double> resultValues;
-  std::vector<double> pendingPayload;
-  int pendingRoundedMilpProfileCode = 0;
-  std::string error;
-};
-
-NativeAsyncJob g_asyncJob;
-
-void markAsyncJobComplete() noexcept {
-  g_asyncJob.activeScip.store(nullptr, std::memory_order_release);
-  g_asyncJob.stageCode.store(7, std::memory_order_release);
-  g_asyncJob.state.store(static_cast<int>(NativeJobState::Complete), std::memory_order_release);
-}
-
-void finishAsyncJobAfterException(const char* message) noexcept {
-  std::lock_guard<std::mutex> lock(g_asyncJob.mutex);
-  g_asyncJob.resultValues.clear();
-  try {
-    g_asyncJob.error = message;
-  } catch (...) {
-    g_asyncJob.error.clear();
-  }
-  markAsyncJobComplete();
-}
-
-void finishAsyncJob(NativeSolveResult&& solveResult) noexcept {
-  try {
-    std::lock_guard<std::mutex> lock(g_asyncJob.mutex);
-    if (g_asyncJob.cancellationRequested.load(std::memory_order_acquire) &&
-        solveResult.status == NativeResultStatus::Optimal) {
-      solveResult.status = NativeResultStatus::Cancelled;
-      solveResult.error = "Computation cancelled.";
-    }
-    g_asyncJob.resultValues = buildBinarySolutionValues(
-      solveResult.model, solveResult.solution, solveResult.telemetry, solveResult.status
-    );
-    g_asyncJob.error = std::move(solveResult.error);
-    markAsyncJobComplete();
-  } catch (const std::bad_alloc&) {
-    finishAsyncJobAfterException("Native ratio solve ran out of memory while finalizing its result.");
-  } catch (const std::exception& ex) {
-    finishAsyncJobAfterException(ex.what());
-  } catch (...) {
-    finishAsyncJobAfterException("Native ratio solve failed with an unknown exception.");
-  }
-}
-
-int startNativeAsyncJob(
+double* solveNativeJob(
   const double* payload,
   int payloadDoubleCount,
-  int roundedMilpProfileCode
+  int roundedMilpProfileCode,
+  int requestId
 ) {
-  if (payload == nullptr || payloadDoubleCount <= 0) return 0;
-  if (g_asyncJob.state.load(std::memory_order_acquire) !=
-      static_cast<int>(NativeJobState::Idle)) {
-    return 0;
-  }
+  g_nativeError.clear();
+  NativeSolveResult result;
+  SolveControl control;
+  control.requestId = requestId;
+  control.startedAt = std::chrono::steady_clock::now();
 
-  std::vector<double> payloadCopy;
-  try {
-    payloadCopy.assign(payload, payload + static_cast<size_t>(payloadDoubleCount));
-  } catch (...) {
-    return 0;
-  }
-  {
-    std::lock_guard<std::mutex> lock(g_asyncJob.mutex);
-    g_asyncJob.resultValues.clear();
-    g_asyncJob.error.clear();
-    g_asyncJob.cancellationRequested.store(false, std::memory_order_release);
-    g_asyncJob.soplexInterruptFlag = false;
-    g_asyncJob.startedAt = std::chrono::steady_clock::now();
-    g_asyncJob.pendingPayload = std::move(payloadCopy);
-    g_asyncJob.pendingRoundedMilpProfileCode = roundedMilpProfileCode;
-    g_asyncJob.state.store(static_cast<int>(NativeJobState::Running), std::memory_order_release);
-  }
-  g_asyncJob.stageCode.store(0, std::memory_order_release);
-  g_asyncJob.activeScip.store(nullptr, std::memory_order_release);
-
-  try {
-    if (!g_asyncJob.worker.joinable()) {
-      g_asyncJob.worker = std::thread([]() {
-        for (;;) {
-          std::vector<double> payloadValues;
-          int roundedMilpProfileCode = 0;
-          {
-            std::unique_lock<std::mutex> lock(g_asyncJob.mutex);
-            g_asyncJob.condition.wait(lock, []() {
-              return !g_asyncJob.pendingPayload.empty();
-            });
-            payloadValues = std::move(g_asyncJob.pendingPayload);
-            roundedMilpProfileCode = g_asyncJob.pendingRoundedMilpProfileCode;
-          }
-
-      try {
-        NativeSolveResult result;
-        SolveControl control;
-        control.interruptFlag = &g_asyncJob.soplexInterruptFlag;
-        control.cancellationRequested = &g_asyncJob.cancellationRequested;
-        control.stageCode = &g_asyncJob.stageCode;
-        control.activeScip = &g_asyncJob.activeScip;
-        control.activeScipMutex = &g_asyncJob.mutex;
-        solveNativeArrayPayloadStructured(
-          payloadValues.data(), static_cast<int>(payloadValues.size()),
-          roundedMilpProfileCode, result, &control
-        );
-        finishAsyncJob(std::move(result));
-      } catch (const std::bad_alloc&) {
-        finishAsyncJobAfterException("Native ratio solve ran out of memory.");
-      } catch (const std::exception& ex) {
-        finishAsyncJobAfterException(ex.what());
-      } catch (...) {
-        finishAsyncJobAfterException("Native ratio solve failed with an unknown exception.");
-      }
-        }
-      });
+  if (payload == nullptr || payloadDoubleCount <= 0) {
+    result.status = NativeResultStatus::InvalidPayload;
+    result.error = "Native ratio payload was empty.";
+  } else {
+    try {
+      solveNativeArrayPayloadStructured(
+        payload,
+        payloadDoubleCount,
+        roundedMilpProfileCode,
+        result,
+        &control
+      );
+    } catch (const std::bad_alloc&) {
+      result.status = NativeResultStatus::InternalError;
+      result.error = "Native ratio solve ran out of memory.";
+    } catch (const std::exception& ex) {
+      result.status = NativeResultStatus::InternalError;
+      result.error = ex.what();
+    } catch (...) {
+      result.status = NativeResultStatus::InternalError;
+      result.error = "Native ratio solve failed with an unknown exception.";
     }
-    g_asyncJob.condition.notify_one();
+  }
+
+  try {
+    g_nativeError = result.error;
+    const std::vector<double> resultValues = buildBinarySolutionValues(
+      result.model, result.solution, result.telemetry, result.status
+    );
+    return copyToOwnedDoubleBuffer(resultValues);
+  } catch (const std::bad_alloc&) {
+    g_nativeError = "Native ratio solve ran out of memory while finalizing its result.";
   } catch (const std::exception& ex) {
-    NativeSolveResult result;
-    result.status = NativeResultStatus::InternalError;
-    result.error = std::string("Failed to start native solve thread: ") + ex.what();
-    finishAsyncJob(std::move(result));
-    return 1;
+    g_nativeError = ex.what();
+  } catch (...) {
+    g_nativeError = "Native ratio solve failed while finalizing its result.";
   }
-
-  return 1;
-}
-
-double* takeNativeAsyncJobResult() {
-  if (g_asyncJob.state.load(std::memory_order_acquire) !=
-      static_cast<int>(NativeJobState::Complete)) {
-    return nullptr;
-  }
-  std::lock_guard<std::mutex> lock(g_asyncJob.mutex);
-  double* result = copyToOwnedDoubleBuffer(g_asyncJob.resultValues);
-  if (result == nullptr) {
-    if (g_asyncJob.resultValues.empty()) {
-      g_asyncJob.state.store(static_cast<int>(NativeJobState::Idle), std::memory_order_release);
-    }
-    return nullptr;
-  }
-  std::vector<double>().swap(g_asyncJob.resultValues);
-  g_asyncJob.state.store(static_cast<int>(NativeJobState::Idle), std::memory_order_release);
-  return result;
+  return nullptr;
 }
 
 char* copyToOwnedCString(const std::string& value) {
@@ -3249,7 +3070,7 @@ int industrialist_has_native_ratio_solver() {
 
 EMSCRIPTEN_KEEPALIVE
 int industrialist_native_abi_version() {
-  return 3;
+  return 4;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -3258,63 +3079,23 @@ int industrialist_native_capabilities() {
 }
 
 EMSCRIPTEN_KEEPALIVE
-int industrialist_start_ratio_job_f64(
+double* industrialist_solve_ratio_f64(
   const double* payload,
   int payloadDoubleCount,
-  int roundedMilpProfileCode
+  int roundedMilpProfileCode,
+  int requestId
 ) {
-  return startNativeAsyncJob(
+  return solveNativeJob(
     payload,
     payloadDoubleCount,
-    roundedMilpProfileCode
+    roundedMilpProfileCode,
+    requestId
   );
 }
 
 EMSCRIPTEN_KEEPALIVE
-int industrialist_get_ratio_job_state() {
-  return g_asyncJob.state.load(std::memory_order_acquire);
-}
-
-EMSCRIPTEN_KEEPALIVE
-int industrialist_get_ratio_job_stage() {
-  return g_asyncJob.stageCode.load(std::memory_order_acquire);
-}
-
-EMSCRIPTEN_KEEPALIVE
-double industrialist_get_ratio_job_elapsed_ms() {
-  if (g_asyncJob.state.load(std::memory_order_acquire) ==
-      static_cast<int>(NativeJobState::Idle)) {
-    return 0.0;
-  }
-  std::lock_guard<std::mutex> lock(g_asyncJob.mutex);
-  return elapsedMilliseconds(g_asyncJob.startedAt);
-}
-
-EMSCRIPTEN_KEEPALIVE
-int industrialist_cancel_ratio_job() {
-  std::lock_guard<std::mutex> lock(g_asyncJob.mutex);
-  if (g_asyncJob.state.load(std::memory_order_acquire) !=
-      static_cast<int>(NativeJobState::Running)) {
-    return 0;
-  }
-  g_asyncJob.cancellationRequested.store(true, std::memory_order_release);
-  g_asyncJob.soplexInterruptFlag = true;
-  SCIP* activeScip = g_asyncJob.activeScip.load(std::memory_order_acquire);
-  if (activeScip != nullptr) {
-    SCIPinterruptSolve(activeScip);
-  }
-  return 1;
-}
-
-EMSCRIPTEN_KEEPALIVE
-double* industrialist_take_ratio_job_result() {
-  return takeNativeAsyncJobResult();
-}
-
-EMSCRIPTEN_KEEPALIVE
-char* industrialist_get_ratio_job_error() {
-  std::lock_guard<std::mutex> lock(g_asyncJob.mutex);
-  return copyToOwnedCString(g_asyncJob.error);
+char* industrialist_get_ratio_error() {
+  return copyToOwnedCString(g_nativeError);
 }
 
 EMSCRIPTEN_KEEPALIVE

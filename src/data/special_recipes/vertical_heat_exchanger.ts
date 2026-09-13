@@ -79,7 +79,12 @@ export const vertical_heat_exchanger_distilled_water: SpecialRecipe = {
       waterSourceTemp: waterTemp,
     });
 
-    const steamQty = isBoiling ? 12000 : helpers ? 0 : 12000;
+    const hasRelevantConnection =
+      helpers?.hasConnection('input', 0) ||
+      helpers?.hasConnection('input', 1) ||
+      helpers?.hasConnection('output', 0) ||
+      helpers?.hasConnection('output', 1);
+    const steamQty = isBoiling ? 12000 : hasRelevantConnection ? 0 : 12000;
 
     const recipe: Recipe = {
       id: 'r_vertical_heat_exchanger_01',
@@ -157,7 +162,12 @@ export const vertical_heat_exchanger_contaminated_water: SpecialRecipe = {
       waterSourceTemp: waterTemp,
     });
 
-    const steamQty = isBoiling ? 12000 : helpers ? 0 : 12000;
+    const hasRelevantConnection =
+      helpers?.hasConnection('input', 0) ||
+      helpers?.hasConnection('input', 1) ||
+      helpers?.hasConnection('output', 0) ||
+      helpers?.hasConnection('output', 1);
+    const steamQty = isBoiling ? 12000 : hasRelevantConnection ? 0 : 12000;
 
     const recipe: Recipe = {
       id: 'r_vertical_heat_exchanger_02',

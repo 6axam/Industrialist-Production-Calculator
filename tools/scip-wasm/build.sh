@@ -10,7 +10,7 @@ PAPILO_URL="${PAPILO_URL:-https://github.com/scipopt/papilo/archive/refs/tags/v$
 TBB_VERSION="${TBB_VERSION:-v2021.13.0}"
 TBB_SHA256="${TBB_SHA256:-3ad5dd08954b39d113dc5b3f8a8dc6dc1fd5250032b7c491eb07aed5c94133e1}"
 TBB_URL="${TBB_URL:-https://github.com/oneapi-src/oneTBB/archive/refs/tags/${TBB_VERSION}.tar.gz}"
-THIRD_PARTY_LICENSES_SHA256="${THIRD_PARTY_LICENSES_SHA256:-5b2b91e8e7cfd594f1124dbede2a6f2c115c2b2215b589baf351097bbc75ca98}"
+THIRD_PARTY_LICENSES_SHA256="${THIRD_PARTY_LICENSES_SHA256:-933567b6be8b65a59ac79fbaf0d50f796579a89cd873536538fd9c00bb5e0eec}"
 
 BUILD_ROOT="${BUILD_ROOT:-/tmp/scip-wasm-build}"
 SOURCE_ARCHIVE="${BUILD_ROOT}/scipoptsuite-${SCIP_VERSION}.tgz"
@@ -28,18 +28,25 @@ PAPILO_INSTALL_DIR="${BUILD_ROOT}/papilo-install"
 PAPILO_CMAKE_DIR="${PAPILO_INSTALL_DIR}/lib/cmake/papilo"
 HOST_BOOST_INCLUDE_ROOT="${BUILD_ROOT}/host-boost-include"
 OUT_DIR="${OUT_DIR:-/workspace/public/scip}"
-WITH_PAPILO="${WITH_PAPILO:-ON}"
-WITH_TBB="${WITH_TBB:-ON}"
-WITH_PTHREADS="${WITH_PTHREADS:-ON}"
-PTHREAD_POOL_SIZE="${PTHREAD_POOL_SIZE:-5}"
+# SCIP 10.0.2's bundled PaPILO package unconditionally advertises a CMake
+# Threads dependency, which is unavailable to the serial Emscripten toolchain.
+# Keep PaPILO opt-in until that upstream package metadata supports this build.
+WITH_PAPILO="${WITH_PAPILO:-OFF}"
+WITH_TBB="${WITH_TBB:-OFF}"
+WITH_PTHREADS="${WITH_PTHREADS:-OFF}"
 BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
 SCIP_CONFIGURE_LOG="${BUILD_ROOT}/scip-configure.log"
 INDUSTRIALIST_WRAPPER_SOURCE="/opt/scip-wasm/industrialist_ratio_wrapper.cpp"
 ACTUAL_PAPILO_SHA256="none"
 ACTUAL_TBB_SHA256="none"
 
-if [[ "${WITH_TBB}" == "ON" && "${WITH_PTHREADS}" != "ON" ]]; then
-  echo "WITH_TBB=ON requires WITH_PTHREADS=ON for a WASM build." >&2
+if [[ "${WITH_PTHREADS}" == "ON" ]]; then
+  echo "WITH_PTHREADS=ON is no longer supported by the single-threaded SCIP WASM build." >&2
+  exit 1
+fi
+
+if [[ "${WITH_TBB}" == "ON" ]]; then
+  echo "WITH_TBB=ON is no longer supported by the single-threaded SCIP WASM build." >&2
   exit 1
 fi
 
@@ -49,7 +56,7 @@ if ! [[ "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 COMMON_C_FLAGS=""
-COMMON_CXX_FLAGS="-I${HOST_BOOST_INCLUDE_ROOT}"
+COMMON_CXX_FLAGS="-I${HOST_BOOST_INCLUDE_ROOT} -fexceptions"
 
 EMSCRIPTEN_LINK_FLAGS=(
   "-sWASM=1"
@@ -61,29 +68,13 @@ EMSCRIPTEN_LINK_FLAGS=(
   "-sALLOW_MEMORY_GROWTH=1"
   "-sINITIAL_MEMORY=134217728"
   "-sMAXIMUM_MEMORY=2147483648"
+  "-fexceptions"
+  "-sNO_DISABLE_EXCEPTION_CATCHING"
   "-sFORCE_FILESYSTEM=1"
-  "-sEXPORTED_FUNCTIONS=_main,_malloc,_free,_industrialist_has_native_ratio_solver,_industrialist_native_abi_version,_industrialist_native_capabilities,_industrialist_start_ratio_job_f64,_industrialist_get_ratio_job_state,_industrialist_get_ratio_job_stage,_industrialist_get_ratio_job_elapsed_ms,_industrialist_cancel_ratio_job,_industrialist_take_ratio_job_result,_industrialist_get_ratio_job_error,_industrialist_free_string,_industrialist_free_result_buffer"
+  "-sEXPORTED_FUNCTIONS=_main,_malloc,_free,_industrialist_has_native_ratio_solver,_industrialist_native_abi_version,_industrialist_native_capabilities,_industrialist_solve_ratio_f64,_industrialist_get_ratio_error,_industrialist_free_string,_industrialist_free_result_buffer"
   "-sEXPORTED_RUNTIME_METHODS=callMain,FS,UTF8ToString,HEAPF64"
   "-sENVIRONMENT=web,worker,node"
 )
-
-if [[ "${WITH_PTHREADS}" == "ON" ]]; then
-  COMMON_C_FLAGS="${COMMON_C_FLAGS} -pthread"
-  COMMON_CXX_FLAGS="${COMMON_CXX_FLAGS} -pthread"
-  EMSCRIPTEN_LINK_FLAGS+=(
-    "-pthread"
-    "-sUSE_PTHREADS=1"
-    "-sPTHREAD_POOL_SIZE=${PTHREAD_POOL_SIZE}"
-  )
-fi
-
-if [[ "${WITH_PAPILO}" == "ON" ]]; then
-  COMMON_CXX_FLAGS="${COMMON_CXX_FLAGS} -fexceptions"
-  EMSCRIPTEN_LINK_FLAGS+=(
-    "-fexceptions"
-    "-sNO_DISABLE_EXCEPTION_CATCHING"
-  )
-fi
 
 echo "==> Preparing build directories"
 rm -rf "${BUILD_ROOT}"
@@ -101,8 +92,6 @@ tar -xzf "${SOURCE_ARCHIVE}" -C "${SOURCE_DIR}" --strip-components=1
 
 if [[ -f "${INDUSTRIALIST_WRAPPER_SOURCE}" ]]; then
   echo "==> Attaching Industrialist native ratio wrapper to SCIP shell target"
-  sed -i 's/set(TPI tny CACHE STRING "options for thread support library")/set(TPI tny CACHE STRING "options for thread support library")/' \
-    "${SOURCE_DIR}/scip/CMakeLists.txt"
   if [[ "${WITH_PAPILO}" == "ON" ]]; then
     sed -i '0,/if(PAPILO OR AUTOBUILD)/s//if(FALSE)/' "${SOURCE_DIR}/CMakeLists.txt"
   fi
@@ -207,21 +196,17 @@ SCIP_CMAKE_ARGS=(
   -DCMAKE_EXE_LINKER_FLAGS="${EMSCRIPTEN_LINK_FLAGS[*]}"
   -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}"
   -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}"
-  -DTHREADS_PREFER_PTHREAD_FLAG=ON
-  -DCMAKE_HAVE_LIBC_PTHREAD=1
-  -DCMAKE_USE_PTHREADS_INIT=1
-  -DThreads_FOUND=TRUE
-  "-DCMAKE_THREAD_LIBS_INIT=-pthread"
   "-DBoost_INCLUDE_DIR=${HOST_BOOST_INCLUDE_ROOT}"
   "-DBoost_INCLUDE_DIRS=${HOST_BOOST_INCLUDE_ROOT}"
   -DBUILD_SHARED_LIBS=OFF
   -DSHARED=OFF
+  -DNO_EXTERNAL_CODE=ON
   -DAUTOBUILD=ON
   -DBUILD_TESTING=OFF
   -DGCG=OFF
   -DUG=OFF
   -DLPS=spx
-  -DTPI=tny
+  -DTPI=none
   -DPAPILO="${WITH_PAPILO}"
   -DZIMPL=OFF
   -DAMPL=OFF
@@ -360,13 +345,12 @@ PaPILO support: ${ACTUAL_PAPILO}
 PaPILO source: $([[ "${WITH_PAPILO}" == "ON" ]] && echo "${PAPILO_URL}" || echo "none")
 PaPILO SHA256: ${ACTUAL_PAPILO_SHA256}
 Pthreads requested: ${WITH_PTHREADS}
-Pthread pool size: $([[ "${WITH_PTHREADS}" == "ON" ]] && echo "${PTHREAD_POOL_SIZE}" || echo "none")
 oneTBB requested: ${WITH_TBB}
 oneTBB source: $([[ "${WITH_TBB}" == "ON" ]] && echo "${TBB_URL}" || echo "none")
 oneTBB SHA256: ${ACTUAL_TBB_SHA256}
 Third-party licenses SHA256: ${ACTUAL_THIRD_PARTY_LICENSES_SHA256}
 Industrialist native ratio wrapper: ON
-Industrialist native ABI: 3
+Industrialist native ABI: 4
 VERSION
 
 echo "==> Running JS/WASM smoke tests"

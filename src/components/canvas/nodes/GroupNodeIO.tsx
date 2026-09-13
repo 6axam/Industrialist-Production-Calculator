@@ -364,7 +364,7 @@ export function GroupNodeIO({
       return;
     }
 
-    const { nodes, edges, nodesMap: latestNodesMap } = useFlowStore.getState();
+    const { nodes, edges, graphVersion, nodesMap: latestNodesMap } = useFlowStore.getState();
     const internalHandleId =
       ref.side === 'input' ? inputProxyHandleIds[ref.index] : outputProxyHandleIds[ref.index];
     if (!internalHandleId) return;
@@ -376,9 +376,15 @@ export function GroupNodeIO({
     if (!isRecipeNode(internalNode)) return;
 
     const flowResultState = useFlowResultStore.getState();
-    const recipe =
-      flowResultState.nodeRecipes[internalNode.id] ??
-      resolveActiveRecipe(internalNode.data.recipeId, internalNode.data.settings, internalNode.id);
+    const currentDbVersion = useDataStore.getState().dbVersion;
+    if (
+      flowResultState.graphVersion !== graphVersion ||
+      flowResultState.dataDbVersion !== currentDbVersion
+    ) {
+      return;
+    }
+
+    const recipe = flowResultState.nodeRecipes[internalNode.id];
     if (!recipe) return;
 
     const recipeNodes = nodes.filter(isRecipeNode);

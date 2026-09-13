@@ -5,6 +5,19 @@
     "patches": [
       {
         "hash": "pending",
+        "version": "v0.8.4",
+        "patch": 4,
+        "date": "2026-09-14",
+        "subject": "fix: simplify native SCIP execution and stabilize thermal solving",
+        "items": [
+          "Rebuilt the SCIP WebAssembly bundle for single-threaded native execution while preserving the browser Worker boundary and staged progress reporting.",
+          "Fixed systemic balancing of temperature-dependent recipes by solving Golden-Section trials against the complete graph and ignoring stale solver snapshots.",
+          "Aligned unconnected boiler and heat-exchanger recipe outputs with recipe-picker previews while preserving graph-resolved temperature behavior after connection.",
+          "Removed the cross-origin-isolation requirement and updated the native smoke tests and build documentation for the serial SCIP bundle."
+        ]
+      },
+      {
+        "hash": "pending",
         "version": "v0.8.3",
         "patch": 3,
         "date": "2026-09-01",
@@ -22,9 +35,7 @@
         "patch": 2,
         "date": "2026-08-25",
         "subject": "fix: correct Chemical Plant formula",
-        "items": [
-          "Corrected the Chemical Plant formula."
-        ]
+        "items": ["Corrected the Chemical Plant formula."]
       },
       {
         "hash": "pending",

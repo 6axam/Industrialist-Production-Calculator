@@ -70,13 +70,8 @@ if (
   scip._industrialist_has_native_ratio_solver() !== 1 ||
   typeof scip._industrialist_native_abi_version !== 'function' ||
   typeof scip._industrialist_native_capabilities !== 'function' ||
-  typeof scip._industrialist_start_ratio_job_f64 !== 'function' ||
-  typeof scip._industrialist_get_ratio_job_state !== 'function' ||
-  typeof scip._industrialist_get_ratio_job_stage !== 'function' ||
-  typeof scip._industrialist_get_ratio_job_elapsed_ms !== 'function' ||
-  typeof scip._industrialist_cancel_ratio_job !== 'function' ||
-  typeof scip._industrialist_take_ratio_job_result !== 'function' ||
-  typeof scip._industrialist_get_ratio_job_error !== 'function' ||
+  typeof scip._industrialist_solve_ratio_f64 !== 'function' ||
+  typeof scip._industrialist_get_ratio_error !== 'function' ||
   typeof scip._industrialist_free_string !== 'function' ||
   typeof scip._industrialist_free_result_buffer !== 'function' ||
   typeof scip.UTF8ToString !== 'function' ||
@@ -87,9 +82,9 @@ if (
   throw new Error('Native Industrialist ratio solver exports were not found.');
 }
 
-if (scip._industrialist_native_abi_version() !== 3) {
+if (scip._industrialist_native_abi_version() !== 4) {
   throw new Error(
-    `Expected Industrialist native ABI 3, got ${scip._industrialist_native_abi_version()}.`,
+    `Expected Industrialist native ABI 4, got ${scip._industrialist_native_abi_version()}.`,
   );
 }
 if ((scip._industrialist_native_capabilities() & 31) !== 31) {
@@ -98,9 +93,23 @@ if ((scip._industrialist_native_capabilities() & 31) !== 31) {
   );
 }
 
+for (const removedExport of [
+  '_industrialist_start_ratio_job_f64',
+  '_industrialist_get_ratio_job_state',
+  '_industrialist_get_ratio_job_stage',
+  '_industrialist_get_ratio_job_elapsed_ms',
+  '_industrialist_cancel_ratio_job',
+  '_industrialist_take_ratio_job_result',
+  '_industrialist_get_ratio_job_error',
+]) {
+  if (typeof scip[removedExport] === 'function') {
+    throw new Error(`Removed native async export is still present: ${removedExport}.`);
+  }
+}
+
 const NATIVE_MAGIC = 444926465;
-const NATIVE_RESULT_VERSION = 2;
-const NATIVE_RESULT_HEADER_DOUBLES = 28;
+const NATIVE_RESULT_VERSION = 3;
+const NATIVE_RESULT_HEADER_DOUBLES = 38;
 const NATIVE_PAYLOAD_MAGIC = 444926466;
 const NATIVE_PAYLOAD_VERSION = 6;
 const METRIC_IDS = [
@@ -172,7 +181,7 @@ function makeNativePayload({
     const metric = metrics[METRIC_IDS[metricIndex]];
     payload.set(
       metric
-        ? [1, metric.weight ?? 1, metric.tier ?? 1, -1, metric.outputGoal ?? -1]
+        ? [1, metric.weight ?? 1, metric.tier ?? 1, metric.limit ?? -1, metric.outputGoal ?? -1]
         : [0, 0, 1, -1, -1],
       10 + metricIndex * 5,
     );
@@ -374,6 +383,19 @@ function makeBoundedProducerPayload({ minimum = 0, maximum }) {
   });
 }
 
+function makeInfeasibleObjectiveLimitPayload() {
+  return makeNativePayload({
+    nodes: [
+      {
+        currentMachineCount: 1,
+        isTarget: true,
+        pollution: 1,
+      },
+    ],
+    metrics: { pollution: { weight: 1, limit: 0 } },
+  });
+}
+
 function makeUndergroundWastePayload() {
   return makeNativePayload({
     nodes: [
@@ -430,35 +452,23 @@ function getNativeResultSectionOffsets(result) {
   };
 }
 
-async function runAsyncNativeJob(payload, cancelImmediately = false, roundedMilpProfile = 0) {
+async function runNativeJob(payload, _cancelImmediately = false, roundedMilpProfile = 0) {
   const payloadPtr = scip._malloc(payload.byteLength);
   if (!payloadPtr) {
-    throw new Error('Failed to allocate asynchronous native payload memory.');
+    throw new Error('Failed to allocate synchronous native payload memory.');
   }
 
   let resultPtr = 0;
   try {
     scip.HEAPF64.set(payload, payloadPtr / Float64Array.BYTES_PER_ELEMENT);
-    if (
-      scip._industrialist_start_ratio_job_f64(payloadPtr, payload.length, roundedMilpProfile) !== 1
-    ) {
-      throw new Error('Failed to start asynchronous native ratio job.');
-    }
+    resultPtr = scip._industrialist_solve_ratio_f64(
+      payloadPtr,
+      payload.length,
+      roundedMilpProfile,
+      -1,
+    );
 
-    const cancellationAccepted = cancelImmediately
-      ? scip._industrialist_cancel_ratio_job() === 1
-      : false;
-    const deadline = Date.now() + 30_000;
-    while (scip._industrialist_get_ratio_job_state() === 1 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 2));
-    }
-    if (scip._industrialist_get_ratio_job_state() !== 2) {
-      throw new Error(
-        `Asynchronous native ratio job did not complete; state=${scip._industrialist_get_ratio_job_state()}, stage=${scip._industrialist_get_ratio_job_stage()}, elapsed=${scip._industrialist_get_ratio_job_elapsed_ms()}ms.`,
-      );
-    }
-
-    const errorPtr = scip._industrialist_get_ratio_job_error();
+    const errorPtr = scip._industrialist_get_ratio_error();
     let nativeError = '';
     try {
       if (errorPtr) nativeError = scip.UTF8ToString(errorPtr);
@@ -466,9 +476,7 @@ async function runAsyncNativeJob(payload, cancelImmediately = false, roundedMilp
       if (errorPtr) scip._industrialist_free_string(errorPtr);
     }
 
-    resultPtr = scip._industrialist_take_ratio_job_result();
     return {
-      cancellationAccepted,
       nativeError,
       result: readNativeResult(resultPtr),
     };
@@ -479,7 +487,7 @@ async function runAsyncNativeJob(payload, cancelImmediately = false, roundedMilp
 }
 
 console.log('Smoke: tuned rounded MILP profile.');
-const roundedJob = await runAsyncNativeJob(
+const roundedJob = await runNativeJob(
   makeSingleNodePayload({
     currentMachineCount: 2.2,
     machineCost: 10,
@@ -519,7 +527,7 @@ if (Math.abs(roundedJob.result[roundedMachineOffset] - 2.2) > 1e-7) {
   );
 }
 
-const continuousAccountingJob = await runAsyncNativeJob(
+const continuousAccountingJob = await runNativeJob(
   makeSingleNodePayload({
     currentMachineCount: 2.2,
     machineCost: 10,
@@ -538,7 +546,7 @@ if (continuousAccountingJob.result[25] !== 0) {
 
 for (const profile of [1, 2, 3]) {
   console.log(`Smoke: rounded MILP comparison profile ${profile}.`);
-  const profileJob = await runAsyncNativeJob(
+  const profileJob = await runNativeJob(
     makeSingleNodePayload({
       currentMachineCount: 2.2,
       machineCost: 10,
@@ -558,7 +566,7 @@ for (const profile of [1, 2, 3]) {
 }
 
 console.log('Smoke: rounded MILP incumbent polishing.');
-const incumbentPolishJob = await runAsyncNativeJob(makeIncumbentPolishPayload());
+const incumbentPolishJob = await runNativeJob(makeIncumbentPolishPayload());
 if (incumbentPolishJob.nativeError || incumbentPolishJob.result[3] !== 1) {
   throw new Error(
     `Incumbent-polish native job failed with status ${incumbentPolishJob.result[3]}: ${incumbentPolishJob.nativeError}`,
@@ -572,7 +580,7 @@ if (incumbentPolishJob.result[25] !== 24 || incumbentPolishJob.result[27] <= 0) 
 
 console.log('Smoke: remaining native ratio cases.');
 console.log('Smoke: bounded producer with locked minimum/maximum.');
-const lockedProducerJob = await runAsyncNativeJob(
+const lockedProducerJob = await runNativeJob(
   makeBoundedProducerPayload({ minimum: 4, maximum: 4 }),
 );
 const lockedProducerOffset = getNativeResultSectionOffsets(lockedProducerJob.result).machineOffset;
@@ -587,7 +595,7 @@ if (
 }
 
 console.log('Smoke: bounded producer with maximum.');
-const cappedProducerJob = await runAsyncNativeJob(makeBoundedProducerPayload({ maximum: 3 }));
+const cappedProducerJob = await runNativeJob(makeBoundedProducerPayload({ maximum: 3 }));
 const cappedProducerOffset = getNativeResultSectionOffsets(cappedProducerJob.result).machineOffset;
 if (
   cappedProducerJob.nativeError ||
@@ -599,7 +607,29 @@ if (
   );
 }
 
-const undergroundWasteJob = await runAsyncNativeJob(makeUndergroundWastePayload());
+console.log('Smoke: infeasible solve followed by a fresh solve.');
+const infeasibleJob = await runNativeJob(makeInfeasibleObjectiveLimitPayload());
+if (
+  !infeasibleJob.nativeError?.startsWith('Native ratio model is infeasible.') ||
+  infeasibleJob.result[3] !== 3
+) {
+  throw new Error(
+    `Infeasible native job did not report the expected status: status=${infeasibleJob.result[3]}, error=${infeasibleJob.nativeError}, result=${Array.from(infeasibleJob.result.slice(0, 40)).join(',')}.`,
+  );
+}
+if (infeasibleJob.result[30] <= 0 || infeasibleJob.result[28] < 0) {
+  throw new Error(
+    `Infeasible native job did not report structured initial-stage diagnostics: stage=${infeasibleJob.result[28]}, kind=${infeasibleJob.result[30]}.`,
+  );
+}
+const postInfeasibleJob = await runNativeJob(makeSingleNodePayload());
+if (postInfeasibleJob.nativeError || postInfeasibleJob.result[3] !== 1) {
+  throw new Error(
+    `Native solve did not recover after an infeasible job: status=${postInfeasibleJob.result[3]}, error=${postInfeasibleJob.nativeError}.`,
+  );
+}
+
+const undergroundWasteJob = await runNativeJob(makeUndergroundWastePayload());
 const undergroundWasteOffset = getNativeResultSectionOffsets(
   undergroundWasteJob.result,
 ).machineOffset;
@@ -622,7 +652,7 @@ if (
   );
 }
 
-const nearIntegerJob = await runAsyncNativeJob(
+const nearIntegerJob = await runNativeJob(
   makeSingleNodePayload({
     currentMachineCount: 2.00000005,
     machineCost: 10,
@@ -645,7 +675,7 @@ if (
   throw new Error('Near-integer native job did not price 2.00000005 as 2 whole machines.');
 }
 
-const aboveIntegerToleranceJob = await runAsyncNativeJob(
+const aboveIntegerToleranceJob = await runNativeJob(
   makeSingleNodePayload({
     currentMachineCount: 2.000000105,
     machineCost: 10,
@@ -668,7 +698,35 @@ if (
   throw new Error('Above-tolerance native job did not price 2.000000105 as 3 whole machines.');
 }
 
-const aboveZeroToleranceJob = await runAsyncNativeJob(
+const machineBoundaryCases = [
+  { value: 30.00000005, expected: 30 },
+  { value: 30.000000135, expected: 31 },
+];
+for (const { value, expected } of machineBoundaryCases) {
+  const boundaryJob = await runNativeJob(
+    makeSingleNodePayload({
+      currentMachineCount: value,
+      machineCost: 1,
+      machineCostWeight: 1,
+    }),
+  );
+  const boundaryStageOffset = Array.from(
+    { length: boundaryJob.result[15] },
+    (_, index) => NATIVE_RESULT_HEADER_DOUBLES + index * 3,
+  ).find((offset) => boundaryJob.result[offset] === 3);
+  if (
+    boundaryJob.nativeError ||
+    boundaryJob.result[3] !== 1 ||
+    boundaryStageOffset === undefined ||
+    Math.abs(boundaryJob.result[boundaryStageOffset + 1] - expected) > 1e-6
+  ) {
+    throw new Error(
+      `Machine-boundary case ${value} expected ${expected} whole machines: status=${boundaryJob.result[3]}, objective=${boundaryStageOffset === undefined ? 'missing' : boundaryJob.result[boundaryStageOffset + 1]}, error=${boundaryJob.nativeError}.`,
+    );
+  }
+}
+
+const aboveZeroToleranceJob = await runNativeJob(
   makeSingleNodePayload({
     currentMachineCount: 0.000000105,
     machineCost: 10,
@@ -691,7 +749,7 @@ if (
   throw new Error('Above-zero-tolerance native job did not price 0.000000105 as 1 whole machine.');
 }
 
-const connectedAboveIntegerProducerJob = await runAsyncNativeJob(
+const connectedAboveIntegerProducerJob = await runNativeJob(
   makeConnectedAboveIntegerProducerPayload(),
 );
 if (
@@ -715,14 +773,14 @@ if (
   throw new Error('Connected producer just above 2 machines was not priced as 3 whole machines.');
 }
 
-const targetlessPowerOutputJob = await runAsyncNativeJob(makeTargetlessPowerOutputPayload());
+const targetlessPowerOutputJob = await runNativeJob(makeTargetlessPowerOutputPayload());
 if (targetlessPowerOutputJob.nativeError || targetlessPowerOutputJob.result[3] !== 1) {
   throw new Error(
     `Targetless production job failed with status ${targetlessPowerOutputJob.result[3]}: ${targetlessPowerOutputJob.nativeError}`,
   );
 }
 
-const mixedScaleJob = await runAsyncNativeJob(makeMixedScaleTargetsPayload());
+const mixedScaleJob = await runNativeJob(makeMixedScaleTargetsPayload());
 if (mixedScaleJob.nativeError || mixedScaleJob.result[3] !== 1) {
   throw new Error(
     `Mixed-scale target job failed with status ${mixedScaleJob.result[3]}: ${mixedScaleJob.nativeError}`,
@@ -743,7 +801,7 @@ if (
   );
 }
 
-const scaledPriorityJob = await runAsyncNativeJob(makeScaledStagePriorityPayload());
+const scaledPriorityJob = await runNativeJob(makeScaledStagePriorityPayload());
 if (scaledPriorityJob.nativeError || scaledPriorityJob.result[3] !== 1) {
   throw new Error(
     `Scaled priority job failed with status ${scaledPriorityJob.result[3]}: ${scaledPriorityJob.nativeError}`,
@@ -774,7 +832,7 @@ if (scaledPrioritySourceCount > 1e-5 || scaledPriorityDeficit > 0.01001) {
   );
 }
 
-const largePriorityJob = await runAsyncNativeJob(
+const largePriorityJob = await runNativeJob(
   makeScaledStagePriorityPayload({ targetMachineCount: 1e9, outputGoal: 1e6 }),
 );
 if (largePriorityJob.nativeError || largePriorityJob.result[3] !== 1) {
@@ -800,7 +858,7 @@ if (Math.abs(targetlessPowerOutputJob.result[targetlessMachineOffset] - 2.5) > 1
   );
 }
 
-const requiredInfiniteJob = await runAsyncNativeJob(
+const requiredInfiniteJob = await runNativeJob(
   makeSingleNodePayload({
     currentMachineCount: 1,
     machineCostWeight: 1,
@@ -813,7 +871,7 @@ if (requiredInfiniteJob.nativeError || requiredInfiniteJob.result[3] !== 1) {
   );
 }
 
-const infiniteChoiceJob = await runAsyncNativeJob(makeInfiniteCostChoicePayload());
+const infiniteChoiceJob = await runNativeJob(makeInfiniteCostChoicePayload());
 if (infiniteChoiceJob.nativeError || infiniteChoiceJob.result[3] !== 1) {
   throw new Error(
     `Infinite-cost choice native job failed with status ${infiniteChoiceJob.result[3]}: ${infiniteChoiceJob.nativeError}`,
@@ -834,7 +892,7 @@ if (
   );
 }
 
-const autocompleteInfiniteChoiceJob = await runAsyncNativeJob(
+const autocompleteInfiniteChoiceJob = await runNativeJob(
   makeInfiniteCostChoicePayload({
     machineCostWeight: 0,
     excludeAvoidableInfiniteCostMachines: true,
@@ -861,24 +919,18 @@ if (
   );
 }
 
-let observedCancellation = false;
-for (let attempt = 0; attempt < 5 && !observedCancellation; attempt += 1) {
-  const cancelledJob = await runAsyncNativeJob(
-    makeSingleNodePayload({
-      currentMachineCount: 2.2,
-      machineCost: 10,
-      machineCostWeight: 1,
-    }),
-    true,
-  );
-  observedCancellation = cancelledJob.cancellationAccepted && cancelledJob.result[3] === 2;
+const nativeStageCodes = [];
+for (let index = 0; index < roundedJob.result[15]; index += 1) {
+  nativeStageCodes.push(roundedJob.result[NATIVE_RESULT_HEADER_DOUBLES + index * 3]);
 }
-if (!observedCancellation) {
-  throw new Error('Native asynchronous job cancellation was never observed across five attempts.');
+for (let index = 1; index < nativeStageCodes.length; index += 1) {
+  if (nativeStageCodes[index] < nativeStageCodes[index - 1]) {
+    throw new Error(`Native stages were not reported in order: ${nativeStageCodes.join(', ')}.`);
+  }
 }
 
 for (let iteration = 0; iteration < 20; iteration += 1) {
-  const repeatedJob = await runAsyncNativeJob(makeSingleNodePayload());
+  const repeatedJob = await runNativeJob(makeSingleNodePayload());
   if (repeatedJob.nativeError || repeatedJob.result[3] !== 1) {
     throw new Error(`Repeated native job ${iteration + 1} failed: ${repeatedJob.nativeError}`);
   }

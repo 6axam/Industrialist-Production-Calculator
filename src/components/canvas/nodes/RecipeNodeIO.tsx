@@ -458,7 +458,6 @@ export function RecipeNodeIO({
   };
 
   const handleDoubleClick = (ref: HandleRef) => {
-    if (!recipe) return;
     if (
       isTutorialActive() &&
       !canPerformTutorialAction({
@@ -471,7 +470,20 @@ export function RecipeNodeIO({
       return;
     }
 
-    const list = ref.side === 'input' ? recipe.inputs : recipe.outputs;
+    const flowResultState = useFlowResultStore.getState();
+    const { graphVersion } = useFlowStore.getState();
+    const currentDbVersion = useDataStore.getState().dbVersion;
+    if (
+      flowResultState.graphVersion !== graphVersion ||
+      flowResultState.dataDbVersion !== currentDbVersion
+    ) {
+      return;
+    }
+
+    const solvedRecipe = flowResultState.nodeRecipes[nodeId];
+    if (!solvedRecipe) return;
+
+    const list = ref.side === 'input' ? solvedRecipe.inputs : solvedRecipe.outputs;
     const entry = list[ref.index];
     if (!entry) return;
     const handleId = buildHandleId(nodeId, ref.side, ref.index);
@@ -483,13 +495,11 @@ export function RecipeNodeIO({
     const recipeEdges = edges.filter(
       (edge) => recipeNodeIds.has(edge.source) && recipeNodeIds.has(edge.target),
     );
-    const allResolvedProducts = useFlowResultStore.getState().resolvedProducts;
     const hasEdges = recipeEdges.some(
       (edge) => edge.sourceHandle === handleId || edge.targetHandle === handleId,
     );
     if (!hasEdges) return;
 
-    const flowResults = useFlowResultStore.getState().results;
     const globalSettings = useGlobalSettingsStore.getState().settings as unknown as Record<
       string,
       unknown
@@ -498,18 +508,18 @@ export function RecipeNodeIO({
     const targetRate = calculateBalancedRate(
       nodeId,
       ref,
-      recipe,
+      solvedRecipe,
       recipeNodes,
       recipeEdges,
-      flowResults,
-      allResolvedProducts,
+      flowResultState.results,
+      flowResultState.resolvedProducts,
       globalSettings,
     );
-    const q = resolveQuantity(ref, recipe);
+    const q = resolveQuantity(ref, solvedRecipe);
     if (q <= 0) return;
     const newMachineCount = constrainMachineCount(
       targetNode.data,
-      calculateMachineCountFromRate(targetRate, recipe.cycle_time, q),
+      calculateMachineCountFromRate(targetRate, solvedRecipe.cycle_time, q),
     );
     useFlowStore.getState().updateNodeData(nodeId, { machineCount: newMachineCount });
     completeTutorialAction({

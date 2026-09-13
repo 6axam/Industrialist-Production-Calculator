@@ -19,8 +19,6 @@ interface ComponentPortRef {
 }
 
 interface ComponentScope {
-  nodeIds: Set<string>;
-  edgeIds: Set<string>;
   ports: ComponentPortRef[];
   connections: SolverConnection[];
 }
@@ -78,8 +76,6 @@ function buildProductScopedComponent(
   }
 
   const visitedHandles = new Set<string>();
-  const nodeIds = new Set<string>();
-  const edgeIds = new Set<string>();
   const ports: ComponentPortRef[] = [];
   const connectionsById = new Map<string, SolverConnection>();
   const queue: string[] = [clickedHandleId];
@@ -92,7 +88,6 @@ function buildProductScopedComponent(
 
     const parsed = parseHandleId(handleId);
     if (parsed) {
-      nodeIds.add(parsed.nodeId);
       ports.push({ nodeId: parsed.nodeId, side: parsed.side, index: parsed.index });
     }
 
@@ -100,14 +95,13 @@ function buildProductScopedComponent(
     if (!neighbors) continue;
     for (let i = 0; i < neighbors.length; i++) {
       const neighbor = neighbors[i];
-      edgeIds.add(neighbor.edgeId);
       connectionsById.set(neighbor.edgeId, neighbor.connection);
       queue.push(neighbor.neighborHandleId);
     }
   }
 
-  if (edgeIds.size === 0) return null;
-  return { nodeIds, edgeIds, ports, connections: Array.from(connectionsById.values()) };
+  if (connectionsById.size === 0) return null;
+  return { ports, connections: Array.from(connectionsById.values()) };
 }
 
 function getUnmet(flowResults: Map<string, NodeFlowResult>, port: ComponentPortRef): number {
@@ -263,9 +257,7 @@ function solveGoldenSection(
   ];
   if (!flowStatus) return 0;
 
-  const localNodes = nodes.filter((node) => scope.nodeIds.has(node.id));
-  const localEdges = edges.filter((edge) => scope.edgeIds.has(edge.id));
-  const targetNodeIndex = localNodes.findIndex((node) => node.id === nodeId);
+  const targetNodeIndex = nodes.findIndex((node) => node.id === nodeId);
   if (targetNodeIndex < 0) return 0;
 
   const cycleTime = recipe.cycle_time;
@@ -280,15 +272,15 @@ function solveGoldenSection(
     else excess += unmet;
   }
 
-  const targetNodeTemplate = localNodes[targetNodeIndex];
-  const trialNodes = localNodes.slice();
+  const targetNodeTemplate = nodes[targetNodeIndex];
+  const trialNodes = nodes.slice();
   const evaluateTrialMetric = (trialRate: number): number => {
     trialNodes[targetNodeIndex] = {
       ...targetNodeTemplate,
       data: { ...targetNodeTemplate.data, machineCount: (trialRate * cycleTime) / trialQuantity },
     };
 
-    const { results: trialResults } = solveFlowPipeline(trialNodes, localEdges, globalSettings);
+    const { results: trialResults } = solveFlowPipeline(trialNodes, edges, globalSettings);
     let unmet = 0;
     for (let i = 0; i < scope.ports.length; i++) {
       unmet += getUnmet(trialResults, scope.ports[i]);
