@@ -12,7 +12,7 @@ const settingDefinitions = {
   target_temperature: {
     type: 'select' as const,
     label: 'Target Temperature (°C)',
-    default: 120,
+    default: 220,
     options: [
       { label: '120°C', value: 120 },
       { label: '220°C', value: 220 },
