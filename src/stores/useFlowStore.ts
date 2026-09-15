@@ -20,6 +20,10 @@ import { nextNodeId, nextEdgeId, parseHandleId, buildHandleId } from '../utils/i
 import { getProductName, getRecipe } from '../data/lookup';
 import { clearFlowCache } from '../solver/flowSolver';
 import {
+  translateOrthogonalTurnsForNodeMoves,
+  type OrthogonalNodeDelta,
+} from '../utils/canvas/orthogonalEdgeRouting';
+import {
   buildEdgeLookupMap,
   resolveHandleProduct,
   resolveHandleType,
@@ -212,6 +216,40 @@ const stripRouteData = (data: Edge['data']): Record<string, unknown> => {
   delete nextData.controlPoints;
   return nextData;
 };
+
+function translateConnectedOrthogonalTurns(
+  edges: Edge[],
+  nodeDeltas: Map<string, OrthogonalNodeDelta>,
+  routeSnapshots?: Map<string, readonly unknown[]>,
+): Edge[] {
+  if (nodeDeltas.size === 0) return edges;
+
+  let changed = false;
+  const nextEdges = edges.map((edge) => {
+    const sourceDelta = nodeDeltas.get(edge.source);
+    const targetDelta = nodeDeltas.get(edge.target);
+    if (!sourceDelta && !targetDelta) return edge;
+
+    const data = edge.data as Record<string, unknown> | undefined;
+    const turns = translateOrthogonalTurnsForNodeMoves(
+      routeSnapshots?.get(edge.id) ?? (data?.orthogonalTurns as readonly unknown[] | undefined),
+      sourceDelta,
+      targetDelta,
+    );
+    if (turns.length === 0) return edge;
+
+    changed = true;
+    return {
+      ...edge,
+      data: {
+        ...data,
+        orthogonalTurns: turns,
+      },
+    };
+  });
+
+  return changed ? nextEdges : edges;
+}
 
 const PLACEHOLDER_PRODUCT_IDS = new Set(['any_fluid', 'any_item']);
 
@@ -862,6 +900,7 @@ const useFlowStore = create(
     let transactionDepth = 0;
     let transactionStart: { nodes: CanvasNode[]; edges: Edge[] } | null = null;
     let dragStartPositions: Map<string, PositionSnapshot> | null = null;
+    let dragStartOrthogonalTurns: Map<string, readonly unknown[]> | null = null;
 
     const pushHistoryEntry = (entry: HistoryEntry<CanvasNode, Edge> | null) => {
       if (!entry) return;
@@ -889,6 +928,7 @@ const useFlowStore = create(
       transactionDepth = 0;
       transactionStart = null;
       dragStartPositions = null;
+      dragStartOrthogonalTurns = null;
       set({
         historyPast: [],
         historyFuture: [],
@@ -1074,16 +1114,26 @@ const useFlowStore = create(
         }
 
         dragStartPositions = nextPositions.size > 0 ? nextPositions : null;
+        const nextRoutes = new Map<string, readonly unknown[]>();
+        for (const edge of get().edges) {
+          const turns = (edge.data as Record<string, unknown> | undefined)?.orthogonalTurns;
+          if (Array.isArray(turns)) {
+            nextRoutes.set(edge.id, turns.map((point) => point));
+          }
+        }
+        dragStartOrthogonalTurns = nextRoutes;
       },
 
       commitDragStop: (nodeIds) => {
         if (isApplyingHistory || transactionDepth > 0) {
           dragStartPositions = null;
+          dragStartOrthogonalTurns = null;
           return;
         }
 
         const startPositions = dragStartPositions;
         dragStartPositions = null;
+        dragStartOrthogonalTurns = null;
         if (!startPositions) return;
 
         const ids = new Set<string>();
@@ -1145,6 +1195,7 @@ const useFlowStore = create(
 
         const state = get();
         let changed = false;
+        const nodeDeltas = new Map<string, OrthogonalNodeDelta>();
         const nextNodes = new Array<CanvasNode>(state.nodes.length);
 
         for (let i = 0; i < state.nodes.length; i++) {
@@ -1166,6 +1217,11 @@ const useFlowStore = create(
           }
 
           changed = true;
+          const dragStart = startPositions.get(node.id);
+          nodeDeltas.set(node.id, {
+            dx: nextPosition.x - (dragStart?.x ?? node.position.x),
+            dy: nextPosition.y - (dragStart?.y ?? node.position.y),
+          });
           nextNodes[i] = {
             ...node,
             position: nextPosition,
@@ -1173,7 +1229,14 @@ const useFlowStore = create(
         }
 
         if (!changed) return;
-        set({ nodes: nextNodes });
+        set({
+          nodes: nextNodes,
+          edges: translateConnectedOrthogonalTurns(
+            state.edges,
+            nodeDeltas,
+            dragStartOrthogonalTurns ?? undefined,
+          ),
+        });
       },
 
       toggleNodeSelection: (nodeId) => {
@@ -1332,6 +1395,26 @@ const useFlowStore = create(
       onNodesChange: (changes) => {
         const state = get();
         const nextNodes = applyNodeChanges(changes, state.nodes);
+        const nodeDeltas = new Map<string, OrthogonalNodeDelta>();
+        for (let i = 0; i < changes.length; i++) {
+          const change = changes[i];
+          if (change.type !== 'position' || !change.position) continue;
+
+          const currentNode = state.nodesMap.get(change.id);
+          if (!currentNode) continue;
+
+          const dragStart = dragStartPositions?.get(change.id);
+          const dx = change.position.x - (dragStart?.x ?? currentNode.position.x);
+          const dy = change.position.y - (dragStart?.y ?? currentNode.position.y);
+          if (dx !== 0 || dy !== 0) {
+            nodeDeltas.set(change.id, { dx, dy });
+          }
+        }
+        const nextEdges = translateConnectedOrthogonalTurns(
+          state.edges,
+          nodeDeltas,
+          dragStartOrthogonalTurns ?? undefined,
+        );
         let needsEnrichment = false;
         let hasStructuralChange = false;
         const dimensionChangedNodeIds = new Set<string>();
@@ -1360,6 +1443,7 @@ const useFlowStore = create(
           const nextIndexes = affectedGroupIds.size > 0 ? createNodeIndexes(finalNodes) : undefined;
           set({
             nodes: finalNodes,
+            ...(nextEdges !== state.edges ? { edges: nextEdges } : {}),
             ...(nextIndexes
               ? {
                   nodesMap: nextIndexes.nodesMap,
@@ -1375,6 +1459,7 @@ const useFlowStore = create(
           nodes: finalNodes,
           nodesMap: nextIndexes.nodesMap,
           groupMemberIds: nextIndexes.groupMemberIds,
+          edges: nextEdges,
           graphVersion: state.graphVersion + 1,
         });
 

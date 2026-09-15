@@ -16,6 +16,11 @@ export interface OrthogonalRouteAnchors {
   targetY: number;
 }
 
+export interface OrthogonalNodeDelta {
+  dx: number;
+  dy: number;
+}
+
 export interface OrthogonalSegment {
   index: number;
   start: EdgeControlPoint;
@@ -222,6 +227,48 @@ export function normalizeOrthogonalTurns(
   }
 
   return normalizeTurnsFromRaw(finiteTurns.slice(0, evenTurnCount), anchors);
+}
+
+export function translateOrthogonalTurnsForNodeMoves(
+  rawTurns: readonly unknown[] | undefined,
+  sourceDelta: OrthogonalNodeDelta | undefined,
+  targetDelta: OrthogonalNodeDelta | undefined,
+): EdgeControlPoint[] {
+  const turns = toFinitePoints(rawTurns);
+  if (turns.length === 0 || (!sourceDelta && !targetDelta)) return turns;
+
+  const nextTurns = turns.map((point) => ({ ...point }));
+  const sameDelta =
+    sourceDelta &&
+    targetDelta &&
+    sourceDelta.dx === targetDelta.dx &&
+    sourceDelta.dy === targetDelta.dy;
+
+  if (sameDelta) {
+    for (let i = 0; i < nextTurns.length; i++) {
+      nextTurns[i].x += sourceDelta.dx;
+      nextTurns[i].y += sourceDelta.dy;
+    }
+    return nextTurns;
+  }
+
+  if (sourceDelta) {
+    const end = Math.min(2, nextTurns.length);
+    for (let i = 0; i < end; i++) {
+      nextTurns[i].x += sourceDelta.dx;
+      nextTurns[i].y += sourceDelta.dy;
+    }
+  }
+
+  if (targetDelta) {
+    const start = Math.max(0, nextTurns.length - 2);
+    for (let i = start; i < nextTurns.length; i++) {
+      nextTurns[i].x += targetDelta.dx;
+      nextTurns[i].y += targetDelta.dy;
+    }
+  }
+
+  return nextTurns;
 }
 
 export function buildOrthogonalPathPoints(
