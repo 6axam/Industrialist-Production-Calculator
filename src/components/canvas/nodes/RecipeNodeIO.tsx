@@ -6,6 +6,7 @@ import { getProduct, getProductName } from '../../../data/lookup';
 import { useUIStore, getEffectiveToggleId } from '../../../stores/useUIStore';
 import { useFlowStore } from '../../../stores/useFlowStore';
 import { useFlowResultStore } from '../../../stores/useFlowResultStore';
+import { useSimulationStore } from '../../../stores/useSimulationStore';
 import { useGlobalSettingsStore } from '../../../stores/useGlobalSettingsStore';
 import { useDataStore } from '../../../stores/useDataStore';
 import {
@@ -201,6 +202,9 @@ interface RecipeNodeIORectProps {
   label: string;
   actualFlow: number;
   nodeId: string;
+  simulationBuffer?: number;
+  simulationRequired?: number;
+  simulationBlocked?: boolean;
 }
 
 function RecipeNodeIORect({
@@ -213,6 +217,9 @@ function RecipeNodeIORect({
   label,
   actualFlow,
   nodeId,
+  simulationBuffer,
+  simulationRequired,
+  simulationBlocked,
 }: RecipeNodeIORectProps) {
   const qty = resolveQuantity(refVal, recipe);
   const list = refVal.side === 'input' ? recipe?.inputs : recipe?.outputs;
@@ -220,11 +227,15 @@ function RecipeNodeIORect({
   const isVariable = !!entry?.variable;
   const scale = entry?.independentOfMachineCount ? 1 : machineCount;
   const totalQty = isVariable ? actualFlow : qty * scale * multiplier;
+  const simulationPercent =
+    simulationRequired && simulationRequired > 0
+      ? Math.min(100, ((simulationBuffer ?? 0) / simulationRequired) * 100)
+      : 0;
 
   return (
     <div className={styles['recipe-node-io__rect-wrapper']}>
       <div
-        className={`${styles['recipe-node-io__rect']} ${styles[`recipe-node-io__rect--${refVal.side}`]} nodrag`}
+        className={`${styles['recipe-node-io__rect']} ${styles[`recipe-node-io__rect--${refVal.side}`]}${simulationBlocked && refVal.side === 'input' ? ` ${styles['recipe-node-io__rect--blocked']}` : ''} nodrag`}
         style={{ '--rect-width': `${width}px` } as React.CSSProperties}
         data-tutorial-rect-node-id={nodeId}
         data-tutorial-rect-side={refVal.side}
@@ -238,6 +249,13 @@ function RecipeNodeIORect({
         <span className={styles['recipe-node-io__rect-text']}>
           {formatQuantity(totalQty)}x {label}
         </span>
+        {refVal.side === 'input' && simulationRequired !== undefined && (
+          <span className={styles['recipe-node-io__simulation']}>
+            <span className={styles['recipe-node-io__simulation-bar']}>
+              <span style={{ width: `${simulationPercent}%` }} />
+            </span>
+          </span>
+        )}
       </div>
     </div>
   );
@@ -324,6 +342,8 @@ export function RecipeNodeIO({
   const flowResult = useFlowResultStore((s) => s.results.get(nodeId));
   const flowResultGraphVersion = useFlowResultStore((s) => s.graphVersion);
   const flowResultDataDbVersion = useFlowResultStore((s) => s.dataDbVersion);
+  const simulationStatus = useSimulationStore((s) => s.status);
+  const simulationNode = useSimulationStore((s) => s.nodes[nodeId]);
   const currentGraphVersion = useFlowStore((s) => s.graphVersion);
   const hasFreshSolveSnapshot =
     flowResultGraphVersion === currentGraphVersion && flowResultDataDbVersion === dbVersion;
@@ -550,6 +570,7 @@ export function RecipeNodeIO({
             className={`${styles['recipe-node-io__column']} ${styles['recipe-node-io__column--left']}`}
           >
             {leftHandles.map((refVal) => {
+              const entry = recipe?.inputs[refVal.index];
               const handleId = buildHandleId(nodeId, refVal.side, refVal.index);
               const fallbackProductId =
                 getRecipeEntryProductId(recipe, refVal.side, refVal.index) || '';
@@ -574,6 +595,17 @@ export function RecipeNodeIO({
                   label={label}
                   actualFlow={actualFlowScaled}
                   nodeId={nodeId}
+                  simulationBuffer={
+                    simulationStatus !== 'idle' && refVal.side === 'input'
+                      ? simulationNode?.inputBuffers[refVal.index]
+                      : undefined
+                  }
+                  simulationRequired={
+                    simulationStatus !== 'idle' && refVal.side === 'input' && entry
+                      ? entry.quantity * (entry.independentOfMachineCount ? 1 : machineCount)
+                      : undefined
+                  }
+                  simulationBlocked={simulationNode?.blocked}
                 />
               );
             })}

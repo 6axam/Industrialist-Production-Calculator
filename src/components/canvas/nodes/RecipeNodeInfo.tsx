@@ -3,6 +3,7 @@ import type { Recipe } from '../../../types/data';
 import type { MachineCountConstraint } from '../../../types/nodes';
 import { useUIStore, getEffectiveToggleId } from '../../../stores/useUIStore';
 import { getSpecialRecipe } from '../../../data/registry';
+import { useSimulationStore } from '../../../stores/useSimulationStore';
 import { getNormalizedCycleTime } from '../../../utils/recipeComputation';
 import {
   formatPollution,
@@ -42,6 +43,8 @@ export function RecipeNodeInfo({
   nodeId,
 }: RecipeNodeInfoProps) {
   const rateMode = useUIStore((s) => s.rateMode);
+  const simulationStatus = useSimulationStore((s) => s.status);
+  const simulationNode = useSimulationStore((s) => s.nodes[nodeId]);
   const displayCycleTime = recipe ? getNormalizedCycleTime(recipe.cycle_time, rateMode) : 0;
   const sr = recipe ? getSpecialRecipe(recipe.id) : undefined;
   const pollutionMultiplier = sr?.pollutionIndependentOfMachineCount ? 1 : machineCount;
@@ -70,6 +73,14 @@ export function RecipeNodeInfo({
     <div className={styles['recipe-node-info']}>
       <div className={styles['recipe-node-info__badges']}>
         {isTarget && <div className={styles['recipe-node-info__target-badge']}>TARGET</div>}
+        {simulationStatus !== 'idle' && (
+          <div
+            className={styles['recipe-node-info__simulation-badge']}
+            data-blocked={simulationNode?.blocked ? 'true' : undefined}
+          >
+            {simulationNode?.blocked ? 'IDLE' : `${(simulationNode?.outputRate ?? 0).toFixed(2)}/s`}
+          </div>
+        )}
       </div>
       {receivedTemp !== undefined && receivedTemp !== null && (
         <div className={styles['recipe-node-info__temp-badge-anchor']}>

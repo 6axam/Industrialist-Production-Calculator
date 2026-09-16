@@ -14,10 +14,15 @@ import {
   Redo,
   ChevronUp,
   ChevronDown,
+  Play,
+  Square,
+  RotateCcw,
 } from 'lucide-react';
 import { useState } from 'react';
 import { useUIStore, getEffectiveToggleId } from '../../stores/useUIStore';
 import { useFlowStore } from '../../stores/useFlowStore';
+import { useSimulationStore } from '../../stores/useSimulationStore';
+import { useFlowResultStore } from '../../stores/useFlowResultStore';
 import { useEdgeThemeStore } from '../../stores/useEdgeThemeStore';
 import { isRatioOptimizerRunning } from '../../solver/ratioOptimizer';
 import { isRecipeNode } from '../../types/nodes';
@@ -82,6 +87,19 @@ const BUTTONS: ButtonConfig[] = [
     dividerBottom: true,
   },
   {
+    id: 'simulation_run',
+    label: 'Run Simulation',
+    type: 'action',
+    Icon: Play,
+    dividerBottom: true,
+  },
+  {
+    id: 'simulation_reset',
+    label: 'Reset Simulation',
+    type: 'action',
+    Icon: RotateCcw,
+  },
+  {
     id: 'coming_soon',
     label: 'Coming Soon',
     type: 'action',
@@ -126,6 +144,14 @@ export function ControlsTray() {
   const canRedo = useFlowStore((s) => s.canRedo);
   const undo = useFlowStore((s) => s.undo);
   const redo = useFlowStore((s) => s.redo);
+  const flowNodes = useFlowStore((s) => s.nodes);
+  const flowEdges = useFlowStore((s) => s.edges);
+  const simulationStatus = useSimulationStore((s) => s.status);
+  const simulationElapsedMs = useSimulationStore((s) => s.elapsedMs);
+  const simulationTicks = useSimulationStore((s) => s.ticks);
+  const simulationRate = useSimulationStore((s) => s.totalOutputRate);
+  const simulationNodes = useSimulationStore((s) => s.nodes);
+  const solvedResults = useFlowResultStore((s) => s.results);
   const setNodesAndEdges = useFlowStore((s) => s.setNodesAndEdges);
   const applyAutoLayoutResult = useFlowStore((s) => s.applyAutoLayoutResult);
   const createGroupFromSelection = useFlowStore((s) => s.createGroupFromSelection);
@@ -208,6 +234,12 @@ export function ControlsTray() {
       }
       useUIStore.getState().setIsLPSolverOpen(true);
       completeTutorialAction({ type: 'control', id: 'compute' });
+    } else if (btn.id === 'simulation_run') {
+      const simulation = useSimulationStore.getState();
+      if (simulation.status === 'running') simulation.stop();
+      else simulation.start(flowNodes, flowEdges);
+    } else if (btn.id === 'simulation_reset') {
+      useSimulationStore.getState().reset(flowNodes, flowEdges);
     } else if (btn.id === 'coming_soon') {
       void useUIStore.getState().confirm({
         title: 'Coming Soon',
@@ -267,6 +299,22 @@ export function ControlsTray() {
     }
   };
 
+  const simulationLabel =
+    simulationStatus === 'running'
+      ? 'Stop Simulation'
+      : simulationStatus === 'stabilized'
+        ? 'Stable'
+        : 'Run Simulation';
+  const simulationIcon = simulationStatus === 'running' ? Square : Play;
+  const elapsedSeconds = Math.floor(simulationElapsedMs / 1000);
+  const blockedNodeCount = Object.values(simulationNodes).filter((node) => node.blocked).length;
+  let solverOutputRate = 0;
+  solvedResults.forEach((result) => {
+    solverOutputRate += result.outputFlows.reduce((total, output) => total + output.rate, 0);
+  });
+  const simulationDifference =
+    solverOutputRate > 0 ? ((simulationRate - solverOutputRate) / solverOutputRate) * 100 : null;
+
   return (
     <div className={styles['controls-tray-container']}>
       <button
@@ -316,8 +364,15 @@ export function ControlsTray() {
                   ? 'Layout...'
                   : btn.id === 'add_recipe' && isAddGroupMode
                     ? 'Add Group'
+                    : btn.id === 'simulation_run'
+                      ? simulationLabel
                     : btn.label;
-            const Icon = btn.id === 'add_recipe' && isAddGroupMode ? Group : btn.Icon;
+            const Icon =
+              btn.id === 'add_recipe' && isAddGroupMode
+                ? Group
+                : btn.id === 'simulation_run'
+                  ? simulationIcon
+                  : btn.Icon;
 
             return (
               <button
@@ -332,6 +387,17 @@ export function ControlsTray() {
               </button>
             );
           })}
+          {simulationStatus !== 'idle' && (
+            <div className={styles['simulation-status']}>
+              <span>{simulationStatus === 'stabilized' ? 'STABLE' : 'STARTING'}</span>
+              <span>{elapsedSeconds}s</span>
+              <span>TICKS {simulationTicks}</span>
+              <span>ACTUAL {simulationRate.toFixed(2)}/s</span>
+              <span>SOLVER {solverOutputRate.toFixed(2)}/s</span>
+              <span>{simulationDifference === null ? 'DIFF --' : `DIFF ${simulationDifference.toFixed(0)}%`}</span>
+              <span>BLOCKED {blockedNodeCount}</span>
+            </div>
+          )}
         </div>
       )}
     </div>

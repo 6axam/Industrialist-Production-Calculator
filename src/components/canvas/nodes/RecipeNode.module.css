@@ -102,6 +102,33 @@
   border-radius: 6px;
 }
 
+.recipe-node-info__simulation-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 72px;
+  min-width: 72px;
+  padding: 0;
+  box-sizing: border-box;
+  height: 24px;
+  overflow: hidden;
+  color: #d9ecff;
+  background: #1769aa;
+  border: 1px solid #258cff;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 0 72px;
+}
+
+.recipe-node-info__simulation-badge[data-blocked='true'] {
+  color: #ffe5b5;
+  background: #744d18;
+  border-color: #f0ad4e;
+}
+
 .recipe-node-info__temp-badge {
   display: inline-flex;
   align-items: center;
@@ -333,6 +360,33 @@
   border: 2px solid;
   border-radius: 6px;
   cursor: pointer;
+}
+
+.recipe-node-io__simulation {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 2;
+  height: 3px;
+}
+
+.recipe-node-io__simulation-bar {
+  width: 100%;
+  min-width: 0;
+  height: 5px;
+  overflow: hidden;
+  background: rgba(6, 55, 91, 0.55);
+}
+
+.recipe-node-io__simulation-bar span {
+  display: block;
+  height: 100%;
+  background: #258cff;
+}
+
+.recipe-node-io__rect--blocked {
+  border-color: var(--theme-color-warning, #f0ad4e);
 }
 
 .recipe-node-io__rect--input {

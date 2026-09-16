@@ -1,5 +1,7 @@
 import React, { Suspense, useEffect, useRef } from 'react';
 import { useUIStore, getEffectiveToggleId } from '../../stores/useUIStore';
+import { useFlowStore } from '../../stores/useFlowStore';
+import { useSimulationStore } from '../../stores/useSimulationStore';
 import { ControlsTray } from '../menu/ControlsTray';
 import { OverlaysTray } from '../menu/OverlaysTray';
 import { DashboardPanels } from '../menu/DashboardPanels';
@@ -135,12 +137,54 @@ export function FlowCanvas() {
   const isZoomedOutStore = useUIStore((s) => s.isZoomedOut);
   const isExporting = useUIStore((s) => s.isExporting);
   const isAutosaveLoaded = useUIStore((s) => s.isAutosaveLoaded);
+  const flowNodes = useFlowStore((s) => s.nodes);
+  const flowEdges = useFlowStore((s) => s.edges);
+  const simulationStatus = useSimulationStore((s) => s.status);
   const promptShownRef = useRef(false);
 
   const isZoomedOut = !isExporting && isZoomedOutStore;
   const isTransforming = !isExporting && isTransformingStore;
+  const simulationGraphKey = JSON.stringify({
+    nodes: flowNodes.map((node) => ({
+      id: node.id,
+      type: node.type,
+      data: node.data,
+    })),
+    edges: flowEdges.map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      sourceHandle: edge.sourceHandle,
+      target: edge.target,
+      targetHandle: edge.targetHandle,
+    })),
+  });
 
   useAutosave();
+
+  useEffect(() => {
+    if (simulationStatus !== 'running') return;
+
+    let animationFrame = 0;
+    let previousTime = performance.now();
+    const tick = (time: number) => {
+      const deltaMs = Math.min(250, Math.max(0, time - previousTime));
+      previousTime = time;
+      const state = useSimulationStore.getState();
+      state.tick(useFlowStore.getState().nodes, useFlowStore.getState().edges, deltaMs);
+      if (useSimulationStore.getState().status === 'running') {
+        animationFrame = requestAnimationFrame(tick);
+      }
+    };
+
+    animationFrame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animationFrame);
+  }, [simulationStatus]);
+
+  useEffect(() => {
+    if (useSimulationStore.getState().status === 'idle') return;
+    const currentFlow = useFlowStore.getState();
+    useSimulationStore.getState().reset(currentFlow.nodes, currentFlow.edges);
+  }, [simulationGraphKey]);
 
   useEffect(() => {
     const hasIdle = typeof window.requestIdleCallback === 'function';
