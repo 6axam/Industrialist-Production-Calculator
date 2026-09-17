@@ -12,7 +12,6 @@ const DEFAULT_TREE_ID = 'm_tree';
 const CANDY_CANE_TREE_ID = 'm_candy_cane_tree';
 const BASE_LOGS_PER_TREE = 2;
 const IGLOO_WINTER_LOG_MULTIPLIER = 1.5;
-const CANDY_CANE_GROWTH_MULTIPLIER = 1.2;
 const MIN_TREE_COUNT = 1;
 const MAX_TREE_COUNT = 650;
 const MIN_HARVESTER_COUNT = 1;
@@ -93,10 +92,6 @@ function getTreeId(
   return getSelectedMachineId(settings, 'tree_id', DEFAULT_TREE_ID, options);
 }
 
-function getTreeGrowthMultiplier(treeId: string): number {
-  return treeId === CANDY_CANE_TREE_ID ? CANDY_CANE_GROWTH_MULTIPLIER : 1;
-}
-
 function hasIglooWinterBonus(
   _settings: Record<string, unknown>,
   globalSettings: Record<string, unknown> | undefined,
@@ -139,33 +134,37 @@ function calculateGrowthModifier(pollution: number): number {
 }
 
 function calculateGrowthTime(pollution: number, treeId = DEFAULT_TREE_ID): number {
-  const growthModifier = calculateGrowthModifier(pollution) * getTreeGrowthMultiplier(treeId);
-  const P = 4500;
+  const growthModifier = calculateGrowthModifier(pollution);
 
-  let total = 0;
-  for (let n = 7; n <= 11; n++) {
-    const value = Math.ceil(P / growthModifier / (n * 100));
-    total += value;
-  }
+  const P = 4500 * (
+    treeId === CANDY_CANE_TREE_ID ? 0.8 : 1
+  );
 
-  const totalGrowthTime = (40 / 3) * total;
-
-  return roundTo(totalGrowthTime, 2);
+  return 2 * (1000 / 30) * ((P / growthModifier) / 900 + 0.5);
 }
+
+const growthTime = calculateGrowthTime(-50, DEFAULT_TREE_ID);
+console.log('TREE DEBUG', {
+  pollution: -50,
+  modifier: calculateGrowthModifier(-50),
+  growthTime,
+  treesFor10Logs: (10 * growthTime) / BASE_LOGS_PER_TREE,
+});
 
 function calculateHarvestersNeeded(
   numTrees: number,
   pollution: number,
   treeId = DEFAULT_TREE_ID,
 ): number {
-  const growthModifier = calculateGrowthModifier(pollution) * getTreeGrowthMultiplier(treeId);
-  const P = 4500;
+  const growthModifier = calculateGrowthModifier(pollution);
+  const P = 4500 * (treeId === CANDY_CANE_TREE_ID ? 0.8 : 1);
 
-  const growthHarvester = 2 * (1000 / 30) * Math.ceil(P / growthModifier / 1000);
-  const harvester = Math.ceil(numTrees / ((3 * growthHarvester) / (1000 / 30)));
+  const growthHarvester =
+    2 * (1000 / 30) * Math.ceil((P / growthModifier) / 1000);
 
-  return harvester;
+  return Math.ceil((numTrees * 11) / growthHarvester);
 }
+
 
 function calculateLogsPerSecond(numTrees: number, growthTime: number, logsPerTree: number): number {
   return (numTrees * logsPerTree) / growthTime;
@@ -197,10 +196,9 @@ function sizeAutocompleteSettings(
   const controllerId = getControllerId(settings, context.globalSettings);
   const treeId = getTreeId(settings, context.globalSettings);
   const logsPerTree = getLogsPerTree(settings, context.globalSettings, controllerId, treeId);
-  const currentOutputRate = roundTo(
-    calculateActualHarvestRate(treeCount, harvesterCount, pollution, treeId) * logsPerTree,
-    6,
-  );
+  const currentOutputRate =
+  calculateActualHarvestRate(treeCount, harvesterCount, pollution, treeId) *
+  logsPerTree;
   const requiredHarvestRate = (currentOutputRate * context.machineCount) / logsPerTree;
   const growthTime = calculateGrowthTime(pollution, treeId);
   const nextTreeCount = clampCount(
@@ -339,7 +337,7 @@ export const tree_farm_01: SpecialRecipe = {
       outputs: [
         {
           product_id: 'p_oak_log',
-          quantity: roundTo(actualHarvestRate * logsPerTree, 6),
+          quantity: actualHarvestRate * logsPerTree,
           temperature: 18,
           voidable: true,
         },

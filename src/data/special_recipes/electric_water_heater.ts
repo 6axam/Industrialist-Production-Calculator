@@ -98,7 +98,7 @@ export const electric_water_heater_03: SpecialRecipe = {
       name: 'Heats Distilled Water',
       machine_id: 'm_electric_water_heater',
       cycle_time: 1,
-      power_use: powerUse,
+      power_use: powerUse * 4,
       power_type: powerType,
       pollution: 0,
       inputs: [{ product_id: 'p_distilled_water', quantity: 6 }],

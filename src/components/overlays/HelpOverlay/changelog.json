@@ -5,6 +5,17 @@
     "patches": [
       {
         "hash": "pending",
+        "version": "v0.8.5",
+        "patch": 5,
+        "date": "2026-09-17",
+        "subject": "fix: correct Tree Farm computations",
+        "items": [
+          "Fixed Tree Farm computations.",
+          "Update Electric Water Heater power use."
+        ]
+      },
+      {
+        "hash": "pending",
         "version": "v0.8.4",
         "patch": 4,
         "date": "2026-09-14",
