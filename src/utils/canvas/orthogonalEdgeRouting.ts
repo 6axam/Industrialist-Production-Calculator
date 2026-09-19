@@ -230,7 +230,7 @@ export function normalizeOrthogonalTurns(
 }
 
 export function translateOrthogonalTurnsForNodeMoves(
-  rawTurns: readonly unknown[] | undefined,
+  rawTurns: readonly EdgeControlPoint[] | undefined,
   sourceDelta: OrthogonalNodeDelta | undefined,
   targetDelta: OrthogonalNodeDelta | undefined,
 ): EdgeControlPoint[] {

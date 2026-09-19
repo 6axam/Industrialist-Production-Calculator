@@ -25,6 +25,7 @@ import {
 } from '../../../utils/canvas/orthogonalEdgeRouting';
 import {
   arePointsAtSamePosition,
+  distanceSquaredPointToSegment,
   projectPointOntoSegment,
   toFinitePoints,
 } from '../../../utils/canvas/edgeGeometry';
@@ -473,7 +474,14 @@ export function RecipeEdge({
       : null;
   const activeOrthHandlePoint =
     showOrthogonalHandle && activeOrthSegment
-      ? (hoveredOrthHandlePoint ?? activeOrthSegment.midpoint)
+      ? hoveredOrthHandlePoint &&
+          distanceSquaredPointToSegment(
+            hoveredOrthHandlePoint,
+            activeOrthSegment.start,
+            activeOrthSegment.end,
+          ) <= ORTHOGONAL_SEGMENT_HITBOX_WIDTH ** 2
+        ? hoveredOrthHandlePoint
+        : activeOrthSegment.midpoint
       : null;
   const sourceHandleParsed = sourceHandleId ? parseHandleId(sourceHandleId) : null;
   const targetHandleParsed = targetHandleId ? parseHandleId(targetHandleId) : null;

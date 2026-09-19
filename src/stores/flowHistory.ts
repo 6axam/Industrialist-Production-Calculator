@@ -36,6 +36,7 @@ export interface PositionHistoryEntry {
     from: PositionSnapshot;
     to: PositionSnapshot;
   }>;
+  edgeDiffs: EdgeHistoryDiff[];
 }
 
 export type HistoryEntry<NodeType extends Node = Node, EdgeType extends Edge = Edge> =
@@ -275,7 +276,8 @@ export function applyPositionHistoryEntry<NodeType extends Node>(
   entry: PositionHistoryEntry,
   direction: 'undo' | 'redo',
   currentNodes: NodeType[],
-): NodeType[] {
+  currentEdges: Edge[] = [],
+): { nodes: NodeType[]; edges: Edge[] } {
   const positionsById = new Map<string, PositionSnapshot>();
   for (let i = 0; i < entry.positions.length; i++) {
     const step = entry.positions[i];
@@ -299,5 +301,15 @@ export function applyPositionHistoryEntry<NodeType extends Node>(
     };
   }
 
-  return changed ? nextNodes : currentNodes;
+  const edgesById = createEdgeMap(currentEdges);
+  for (let i = 0; i < entry.edgeDiffs.length; i++) {
+    const diff = entry.edgeDiffs[i];
+    const nextEdge = direction === 'undo' ? diff.before : diff.after;
+    if (nextEdge) edgesById.set(diff.id, nextEdge);
+  }
+
+  return {
+    nodes: changed ? nextNodes : currentNodes,
+    edges: orderEdgesById(edgesById, currentEdges.map((edge) => edge.id)),
+  };
 }
