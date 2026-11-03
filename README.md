@@ -33,8 +33,8 @@ To maintain code hygiene, this codebase adheres to strict design contracts:
 
 - **React Compiler:** This project uses the React Compiler. **Do not** manually add `useMemo`, `useCallback`, or `React.memo` to components, as they are automatically optimized.
 - **Zustand State:** Global state is split into isolated stores (e.g., `useFlowStore` for nodes/edges, `useFlowResultStore` for solver outputs). Do not subscribe high-frequency interactive canvas components directly to global arrays; use selective selectors.
-- **Styling Architecture:** All styling is completely flat, instant, and technical. There are no glows, shadows, gradients, or animations (except loading spinners, save buttons, and material flow dashed edges). Hex, HSL, or RGB colors are strictly prohibited in TSX files and component CSS files; all styling must reference variables defined in [src/index.css](file:///c:/Users/William/Documents/Web%20Apps/industrialist-calculator/src/index.css).
-- **Data Decoupling:** The persistence layer ([src/persistence/](file:///c:/Users/William/Documents/Web%20Apps/industrialist-calculator/src/persistence/)) does not know about recipe formulas or schemas. Save files act as unopinionated data carriers.
+- **Styling Architecture:** All styling is completely flat, instant, and technical. There are no glows, shadows, gradients, or animations (except loading spinners, save buttons, and material flow dashed edges). Hex, HSL, or RGB colors are strictly prohibited in TSX files and component CSS files; all styling must reference variables defined in [src/index.css](./src/index.css).
+- **Data Decoupling:** The persistence layer ([src/persistence/](./src/persistence/)) does not know about recipe formulas or schemas. Save files act as unopinionated data carriers.
 - **TypeScript and Linting:** Strict module compilation is enforced with `verbatimModuleSyntax: true` (explicit `import type` must be used). ESLint warnings/errors must be resolved structurally—do not use `eslint-disable` comments.
 
 ---
@@ -85,7 +85,7 @@ To maintain code hygiene, this codebase adheres to strict design contracts:
 
 ### Prerequisites
 
-- **Node.js**: `^18.0.0` or `^20.0.0` (LTS recommended)
+- **Node.js**: `^20.19.0`, `^22.13.0`, or `>=24` (required by the locked Vite and ESLint versions)
 - **NPM**: `^9.0.0` or higher
 
 ### Clone & Local Setup
@@ -93,7 +93,7 @@ To maintain code hygiene, this codebase adheres to strict design contracts:
 1.  Clone the repository:
 
     ```bash
-    git clone https://github.com/Pollywrath/Industrialist-Production-Calculator.git
+    git clone https://github.com/6axam/Industrialist-Production-Calculator.git
     cd Industrialist-Production-Calculator
     ```
 
